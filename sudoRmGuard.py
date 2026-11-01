@@ -53,7 +53,7 @@ SCRATCH_ROOTS = ["/tmp", os.path.join(HOME, "tmp")]
 INTERP_RE = re.compile(r"^(python[\d.]*|node|perl|ruby|bash|sh|zsh|dash)$")
 # cheap pre-filter: commands that can't contain anything guarded skip analysis
 INTEREST_RE = re.compile(
-    r"(^|[^\w.-])(sudo|rm|rmdir|docker|podman|python[\d.]*|node|perl|ruby|bash|sh|zsh|dash)(\s|$|;|\))"
+    r"(^|[^\w.-])(sudo|rm|rmdir|docker|podman|ssh|python[\d.]*|node|perl|ruby|bash|sh|zsh|dash)(\s|$|;|\))"
     r"|(^|[\s;&|(])\.?\.?/[\w./-]+")
 
 # sudo <cmd>: read-only commands, with args that would make them write rejected
@@ -223,15 +223,18 @@ class Part:
     def __init__(self, kind, match, desc, sha=None, sudo=None, preview=None):
         self.kind, self.match, self.desc = kind, match, desc
         self.sha, self.sudo, self.preview = sha, sudo, preview
+        self.env = None  # None = here (currentEnv()); "ssh:[user@]host[:port]" for remote parts
 
 
 class Ctx:
-    def __init__(self, cwd):
+    def __init__(self, cwd, remote=False):
         self.cwd = cwd
-        self.vars = {"HOME": HOME}
+        self.remote = remote       # analyzing a command that runs over ssh
+        self.vars = {} if remote else {"HOME": HOME}
         self.allTrivial = True     # every unguarded part is ok
         self.parts = []            # guarded Parts
         self.heredocBodies = []
+        self.sshHeredocs = []      # heredoc bodies whose command line mentions ssh
         self.nCommands = 0
 
 
@@ -246,18 +249,35 @@ def expandVars(s, ctx):
     s = re.sub(r"\$\{(\w+)\}|\$(\w+)", rep, s)
     if "$" in s:
         raise Ask("unexpandable $ in path")
-    if s == "~" or s.startswith("~/"):
+    if (s == "~" or s.startswith("~/")) and not ctx.remote:
         s = HOME + s[1:]
     return s
 
 
 def absPath(p, ctx):
     p = expandVars(p, ctx)
+    if ctx.remote and p.startswith("~"):
+        return p  # remote home: keep as written
     if not os.path.isabs(p):
         if ctx.cwd is None:
             raise Ask("relative path with unknown cwd")
         p = os.path.join(ctx.cwd, p)
     return os.path.normpath(p) if not (set(p) & GLOB_CHARS) else p
+
+
+def isUnderRootRemote(path):
+    """Remote paths can't be resolved; purely textual check against /tmp and ~/tmp."""
+    globIdx = next((i for i, c in enumerate(path) if c in GLOB_CHARS), None)
+    if globIdx is not None:
+        head, rest = path[:globIdx], path[globIdx:]
+        if ".." in rest.split("/"):
+            return False
+        # dir containing the glob must be strictly below a root
+        target = os.path.normpath(head if head.endswith("/") else os.path.dirname(head))
+    else:
+        target = os.path.dirname(os.path.normpath(path)) + "/" + os.path.basename(os.path.normpath(path))
+        target = os.path.normpath(target)
+    return any(target.startswith(r + "/") for r in ("/tmp", "~/tmp"))
 
 
 def isUnderRoot(path):
@@ -310,7 +330,8 @@ def checkRm(words, ctx, prefix=()):
     # Plain rm of scratch paths needs no rule; sudo rm always does.
     head = list(prefix) + [words[0]] + flags
     for p, a in zip(paths, absPaths):
-        if not prefix and flagsOk and isUnderRoot(a):
+        underRoot = isUnderRootRemote(a) if ctx.remote else isUnderRoot(a)
+        if not prefix and flagsOk and underRoot:
             continue
         where = "" if prefix else " (outside /tmp, ~/tmp)"
         addCmdPart(head + [a], f"{joinWords(head)} {p}{where}", ctx)
@@ -386,6 +407,10 @@ def checkScriptRun(name, args, ctx, underSudo, wordsForCmd):
                                   sudo=True, preview=body[:200]))
         else:
             ctx.allTrivial = False
+        return
+    if ctx.remote:
+        # can't hash a file on another machine: exact-command rule instead
+        addCmdPart(wordsForCmd, f"remote script run {rest[0]}", ctx)
         return
     try:
         path = os.path.realpath(absPath(rest[0], ctx))
@@ -529,6 +554,162 @@ def stripWrappers(words):
     return words
 
 
+SSH_VALUE_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")
+SSH_FORWARD_OPTS = set("LRDWwO")  # forwarding / control: not a plain remote command
+SSH_LOCAL_EXEC_OPTIONS = re.compile(r"^(proxycommand|localcommand|permitlocalcommand|remotecommand|"
+                                    r"proxyusefdpass|knownhostscommand)\b", re.I)
+
+
+def checkSsh(words, ctx, depth):
+    """ssh [opts] [user@]host [cmd...]: analyze cmd (or a heredoc script on stdin) as a
+    remote command whose parts get env "ssh:[user@]host[:port]"."""
+    args = words[1:]
+    user = port = None
+    i = 0
+    while i < len(args) and args[i].startswith("-") and args[i] != "-":
+        a = args[i]
+        if a == "--":
+            i += 1
+            break
+        j = 1
+        while j < len(a):
+            c = a[j]
+            if c in SSH_VALUE_OPTS:
+                val = a[j + 1:] or (args[i + 1] if i + 1 < len(args) else "")
+                if not a[j + 1:]:
+                    i += 1
+                if c in SSH_FORWARD_OPTS:
+                    addCmdPart(words, f"ssh -{c} (forwarding/control)", ctx)
+                    return
+                if c == "o" and SSH_LOCAL_EXEC_OPTIONS.match(val):
+                    addCmdPart(words, f"ssh -o {val.split('=')[0]} runs a local command", ctx)
+                    return
+                if c == "l":
+                    user = val
+                if c == "p":
+                    port = val
+                break
+            if c == "N":
+                addCmdPart(words, "ssh -N (no remote command)", ctx)
+                return
+            j += 1
+        i += 1
+    if i >= len(args):
+        raise Ask("ssh with no host")
+    host = args[i]
+    if "@" in host:
+        user, host = host.rsplit("@", 1)
+    rest = args[i + 1:]
+    env = "ssh:" + (f"{user}@" if user else "") + host + (f":{port}" if port else "")
+
+    if not rest or (os.path.basename(rest[0]) in SHELLS and not ({"-c"} & set(rest[1:]))):
+        # interactive, or a shell reading its script from stdin (heredoc)
+        if not ctx.sshHeredocs:
+            addCmdPart(words, f"interactive ssh to {host}", ctx)
+            return
+        script = "\n".join(ctx.sshHeredocs)
+    else:
+        script = " ".join(rest)  # ssh joins the remaining args with spaces
+
+    rctx = Ctx(None, remote=True)
+    analyzeScript(script, rctx, depth + 1)
+    for p in rctx.parts:
+        p.env = env
+    ctx.parts += rctx.parts
+    if not rctx.allTrivial:
+        ctx.allTrivial = False
+
+
+# ---- same-host detection for ssh envs
+
+_sshResolveCache = {}
+_knownKeysCache = {}
+HOST_ALIASES = []  # [set(names)], from the rules file's "hosts" section
+
+
+def parseSshEnv(spec):
+    """'user@host:port' -> (user or None, host, port or None)."""
+    user, _, hostPort = spec.rpartition("@")
+    host, port = hostPort, None
+    m = re.fullmatch(r"(.+):(\d+)", hostPort)
+    if m and not hostPort.startswith("["):
+        host, port = m.group(1), m.group(2)
+    return user or None, host, port
+
+
+def sshResolve(user, host, port):
+    """Effective (user, hostname, port) via `ssh -G` (applies ~/.ssh/config, no connect)."""
+    key = (user, host, port)
+    if key not in _sshResolveCache:
+        cmd = ["ssh", "-G"] + (["-l", user] if user else []) + (["-p", port] if port else []) + [host]
+        res = (user, host, port or "22")
+        try:
+            import subprocess
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+            cfg = dict(l.split(" ", 1) for l in out.splitlines() if " " in l)
+            res = (cfg.get("user", user), cfg.get("hostname", host).lower(), cfg.get("port", port or "22"))
+        except Exception:
+            pass
+        _sshResolveCache[key] = res
+    return _sshResolveCache[key]
+
+
+def knownHostKeys(hostname, port):
+    """Host keys recorded for hostname[:port] in known_hosts (public keys only)."""
+    key = (hostname, port)
+    if key not in _knownKeysCache:
+        entry = hostname if port == "22" else f"[{hostname}]:{port}"
+        keys = set()
+        try:
+            import subprocess
+            out = subprocess.run(["ssh-keygen", "-F", entry], capture_output=True, text=True,
+                                 timeout=3).stdout
+            for line in out.splitlines():
+                f = line.split()
+                if len(f) >= 3 and not line.startswith("#"):
+                    keys.add((f[-2], f[-1]))
+        except Exception:
+            pass
+        _knownKeysCache[key] = keys
+    return _knownKeysCache[key]
+
+
+def aliasGroup(name):
+    name = name.lower()
+    for g in HOST_ALIASES:
+        if name in g:
+            return g
+    return {name}
+
+
+def sameSshTarget(a, b):
+    """Do two 'user@host:port' specs reach the same account on the same machine?"""
+    ua, ha, pa = parseSshEnv(a)
+    ub, hb, pb = parseSshEnv(b)
+    ra, rb = sshResolve(ua, ha, pa), sshResolve(ub, hb, pb)
+    if ra[0] != rb[0]:
+        return False  # different remote user
+    names = lambda h, r: aliasGroup(h) | aliasGroup(r[1])
+    if names(ha, ra) & names(hb, rb):
+        return True
+    if (ra[1], ra[2]) == (rb[1], rb[2]):
+        return True
+    ka, kb = knownHostKeys(ra[1], ra[2]), knownHostKeys(rb[1], rb[2])
+    return bool(ka & kb)
+
+
+def envMatches(ruleEnv, partEnv):
+    here = partEnv or currentEnv()
+    if ruleEnv is None or ruleEnv == "":
+        return not here.startswith("ssh:")  # unscoped rules never apply to remote hosts
+    if ruleEnv == "*" or textMatches(ruleEnv, here):
+        return True
+    if ruleEnv.startswith("ssh:") and here.startswith("ssh:") \
+            and "*" not in ruleEnv and not ruleEnv.startswith("re:"):
+        return sameSshTarget(ruleEnv[4:], here[4:])
+    return False
+
+
 def checkSudo(words, ctx):
     args = words[1:]
     i = 0
@@ -622,6 +803,10 @@ def analyzeCommand(words, ctx, depth):
         ctx.allTrivial = False
         return
 
+    if name == "ssh":
+        checkSsh(words, ctx, depth)
+        return
+
     if name == "eval":
         if any(INTEREST_RE.search(a) for a in args):
             raise Ask("eval of a guarded command")
@@ -658,7 +843,7 @@ def analyzeCommand(words, ctx, depth):
     if INTERP_RE.match(name):
         checkScriptRun(name, args, ctx, False, words)
         return
-    if "/" in words[0] and ctx.cwd is not None:
+    if "/" in words[0] and ctx.cwd is not None and not ctx.remote:
         p = os.path.join(ctx.cwd, os.path.expanduser(words[0]))
         if isDirectExec(p):
             checkScriptFile(os.path.realpath(p), False, ctx)
@@ -671,6 +856,7 @@ def analyzeCommand(words, ctx, depth):
 def analyzeScript(cmd, ctx, depth=0):
     cmd, bodies = stripHeredocs(cmd)
     ctx.heredocBodies += [b for _, b in bodies]
+    ctx.sshHeredocs += [b for line, b in bodies if re.search(r"\bssh\b", line)]
     for line, body in bodies:
         if re.search(r"(^|[^\w.-])(sudo|rm|rmdir)(\s|$)", body) \
                 and re.search(r"(^|[\s;&|(])(bash|sh|zsh|dash|sudo)\b", line) \
@@ -760,19 +946,18 @@ def currentEnv():
     return _envCache[0]
 
 
-def scopeMatches(rule, session, project):
+def scopeMatches(rule, session, project, partEnv=None):
     s = rule.get("session", "*")
     if s not in ("*", session):
         return False
-    env = rule.get("env") or "*"
-    if env != "*" and not textMatches(env, currentEnv()):
+    if not envMatches(rule.get("env"), partEnv):
         return False
     p = (rule.get("path") or "/").rstrip("/") or "/"
     return p == "/" or project == p or project.startswith(p + "/")
 
 
 def ruleMatches(rule, part, session, project):
-    if rule.get("kind") != part.kind or not scopeMatches(rule, session, project):
+    if rule.get("kind") != part.kind or not scopeMatches(rule, session, project, part.env):
         return False
     # sudo parts need an explicit "sudo": true; a sudo rule also covers the non-sudo form
     if part.kind in ("script", "inline", "pkill") and part.sudo and not rule.get("sudo"):
@@ -784,16 +969,35 @@ def ruleMatches(rule, part, session, project):
     return textMatches(rule.get("match", ""), part.match)
 
 
+def specificity(rule):
+    """Sort key: higher = more specific. Compared in order session, path, env, match."""
+    sessionSpec = 1 if rule.get("session") not in (None, "", "*") else 0
+    path = (rule.get("path") or "/").rstrip("/")
+    pathSpec = len([p for p in path.split("/") if p])
+    env = rule.get("env") or "*"
+    envSpec = 0 if env == "*" else (1 if ("*" in env or env.startswith("re:")) else 2)
+    m = rule.get("match", "")
+    literal = len(m.replace("*", ""))
+    if m.startswith("re:") or m.endswith("*$"):
+        matchSpec = (0, literal)
+    elif "*" in m:
+        matchSpec = (1, literal)
+    else:
+        matchSpec = (2, literal)
+    return (sessionSpec, pathSpec, envSpec, matchSpec)
+
+
 def lookup(rules, part, session, project):
-    """'ask' if any matching ask rule, 'allow' if any matching allow rule, else None."""
-    found = None
+    """Decision of the most specific matching rule ('allow'/'ask'), else None.
+    Equally specific allow + ask -> 'ask'."""
+    best, bestKey = None, None
     for r in rules:
-        if ruleMatches(r, part, session, project):
-            if r.get("decision") == "ask":
-                return "ask"
-            if r.get("decision") == "allow":
-                found = "allow"
-    return found
+        if r.get("decision") not in ("allow", "ask") or not ruleMatches(r, part, session, project):
+            continue
+        k = specificity(r)
+        if bestKey is None or k > bestKey or (k == bestKey and r.get("decision") == "ask"):
+            best, bestKey = r.get("decision"), k
+    return best
 
 
 VALUE_SHORT_FLAGS = {"-v", "-u"}
@@ -825,7 +1029,7 @@ def short(s, n=60):
 def explainPart(part, rules, session, project):
     """For an unmatched part, describe how it differs from the closest literal rule."""
     cands = [r for r in rules if r.get("kind") == part.kind and r.get("decision") == "allow"
-             and scopeMatches(r, session, project)
+             and scopeMatches(r, session, project, part.env)
              and (not part.sudo or r.get("sudo") or part.kind in ("cmd", "container"))
              and "*" not in r.get("match", "") and not r.get("match", "").startswith("re:")]
     if part.kind == "script":
@@ -881,7 +1085,7 @@ def proposeRule(part, session, project):
         rule.update(sudo=True, preview=part.preview)
     elif part.kind == "pkill":
         rule["sudo"] = True
-    rule.update(session=session, path=project, env=currentEnv(), at=nowText(),
+    rule.update(session=session, path=project, env=part.env or currentEnv(), at=nowText(),
                 # informational only: survives widening session/path to "*"
                 **{"from": f"{currentEnv()} {project} session {session[:8]}"})
     return rule
@@ -903,6 +1107,11 @@ def validateRules(data):
     for name in ("rules", "pending"):
         if not isinstance(data[name], list):
             raise RulesFileError(f'"{name}" must be a list')
+    hosts = data.get("hosts", {})
+    if not isinstance(hosts, dict) or not all(
+            isinstance(v, list) and all(isinstance(x, str) for x in v) for v in hosts.values()):
+        raise RulesFileError('"hosts" must map a name to a list of aliases')
+    HOST_ALIASES[:] = [{k.lower(), *(x.lower() for x in v)} for k, v in hosts.items()]
     for i, r in enumerate(data["rules"]):
         if not isinstance(r, dict) or not isinstance(r.get("kind"), str) \
                 or not isinstance(r.get("match"), str):
@@ -1022,6 +1231,7 @@ def saveRules(data):
             out["rules"] = [ordered(x) for x in out["rules"]]
         return out
     text = json.dumps({
+        "hosts": data.get("hosts", {}),
         "rules": [ordered(r) for r in sorted(data["rules"], key=lambda r: r.get("at", ""))],
         "pending": [ordered(p) for p in sorted(data["pending"], key=lambda p: p.get("at", ""))],
     }, indent=2, ensure_ascii=False) + "\n"
@@ -1074,9 +1284,9 @@ def decide(cmd, cwd, session="", data=None):
 
     asks, proposals, seen = [], [], set()
     for part in ctx.parts:
-        if (part.kind, part.match, part.sha) in seen:
+        if (part.kind, part.match, part.sha, part.env) in seen:
             continue
-        seen.add((part.kind, part.match, part.sha))
+        seen.add((part.kind, part.match, part.sha, part.env))
         d = lookup(data["rules"], part, session, project)
         if d == "allow":
             continue

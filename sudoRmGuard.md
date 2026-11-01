@@ -89,7 +89,7 @@ If the hook itself crashes before a command runs, it answers `ask` with the erro
 | `match` | text with `*` / `*$` wildcards, or `re:<regex>` | See [Matching](#matching). |
 | `session` | session id or `"*"` | `"*"` means every session. |
 | `path` | a directory or `"/"` | Applies when the session's project folder (the nearest folder containing `.git`, otherwise the cwd) is this directory or inside it. `"/"` means everywhere. |
-| `env` | `host`, `container:<name>`, `container:*` or `"*"` | Where the hook is running. Learned rules record the current one. `container:<name>` comes from podman's `/run/.containerenv`, or the hostname under docker (`/.dockerenv`). `*` wildcards work as in `match`. A missing field means anywhere. Your devcontainer sessions share this file, so use this to keep container-only approvals off the host. |
+| `env` | `host`, `container:<name>`, `ssh:[user@]host[:port]`, wildcards, or `"*"` | Where the command runs. Learned rules record it. `container:<name>` comes from podman's `/run/.containerenv`, or the hostname under docker (`/.dockerenv`). `ssh:…` is for commands run over ssh (see [SSH](#ssh)). `*` wildcards work as in `match`. A **missing** `env` means any local env (host or container) but **never** an ssh host. `"*"` means everywhere, including ssh. Your devcontainer sessions share this file, so use this to keep container-only approvals off the host. |
 | `from` | text | Informational only: where the rule was first learned (env, project, session). Not used for matching, so it still tells you where a widened rule came from. |
 | `sha` | 20 hex chars or `"*"` | **script rules only.** A short hash of the file's content. `"*"` accepts any content. |
 | `sudo` | `true` / `false` | **script, inline, pkill.** `true` covers the command with or without sudo. `false`, or a missing field, covers only the non-sudo form, so approving `python3 x.py` never approves `sudo python3 x.py`. |
@@ -177,8 +177,57 @@ Things to keep in mind:
 - `*$` matches `bash -c '…'` and anything else. `sudo chroot /var/tmp/jjp_run *$` really does mean "anything as root inside that chroot".
 - `-v /var/tmp/jjp_run/*` doesn't cover `-v /var/tmp/jjp_run:/jail`, which mounts `jjp_run` itself, because there's no `/` after it. Add that mount as its own pattern. `jjp_run*` would cover both, but also `jjp_run2`.
 - Arguments that contain spaces are quoted in `match` (`'a b'`), so a plain `*` can't match them. Use `*$` or `re:`.
-- `ask` beats `allow`. If any matching rule says `ask`, you get a prompt, even if a broader `allow` rule also matches. Use this to make exceptions to a wildcard.
+- When several rules match, the **most specific** one decides (see [Rule precedence](#rule-precedence)).
 - In `re:` rules, regex characters like `.`, `+` and `(` are special. Escape them to match them literally.
+
+## Rule precedence
+
+When several rules match a part, the most specific one decides. Specificity is compared field by field, in this order. The first difference decides:
+
+1. **`session`:** a specific session id beats `*` or a missing session.
+2. **`path`:** a deeper folder beats a shallower one. `/` or a missing path is least specific.
+3. **`env`:** an exact env (`host`, `container:dev1`, `ssh:nas`) beats a wildcard (`container:*`, `ssh:*`), which beats `*` or a missing env.
+4. **`match`:** literal text beats a pattern with `*`, which beats `*$` and `re:`. Within the same group, more literal characters win.
+
+If an `allow` and an `ask` rule are equally specific, **`ask` wins**.
+
+Examples:
+- a global `ask` plus an `allow` for one session → allowed in that session, asked everywhere else
+- an `ask` for a path plus an `allow` for one session → allowed in that session, because session is compared first
+- in one scope, `allow sudo rm *$` plus `ask sudo rm -rf /var/tmp/important` → that one path asks, everything else is allowed
+
+## SSH
+
+`ssh [options] [user@]host '<cmd>'` isn't judged as one command. The remote `<cmd>` is split and judged exactly like a local command, and every part gets `env: "ssh:[user@]host[:port]"`. So `ssh nas 'docker ps; ls ~/x'` is allowed, and `ssh linveo 'sudo systemctl restart nginx'` asks once and is then remembered for that host only. Wrappers like `timeout 20 ssh …` are removed as usual.
+
+- **Heredoc scripts:** `ssh host <<EOF` and `ssh host sh -s <<EOF` / `bash -s` treat the heredoc as the remote script.
+- **Remote differences:**
+  - `~` is kept as written, not expanded to your local home.
+  - `rm` inside `/tmp` or `~/tmp` is checked as text only.
+  - A remote script run (`ssh host 'python3 x.py'`) gets an exact-command `cmd` rule, because the file can't be hashed.
+- **Always ask, as a whole (`env` = local):**
+  - an interactive `ssh host` (no command, no heredoc)
+  - forwarding or control options (`-L`, `-R`, `-D`, `-W`, `-w`, `-O`)
+  - `-N`
+  - `-o ProxyCommand`/`LocalCommand`/`RemoteCommand`/`KnownHostsCommand`, which run local commands
+- **Same machine, different name:** an `ssh:X` rule also matches `ssh:Y` when the remote **user** is the same (as `ssh -G` resolves it) and any of these is true:
+  1. X and Y are in the same `hosts` alias group (below),
+  2. `ssh -G` resolves both to the same hostname and port (ssh config aliases),
+  3. `known_hosts` has the same host key for both (via `ssh-keygen -F`, public keys only). This links tailscale and LAN addresses once you've ssh'd to each.
+- **Wildcards:** `ssh:*` matches any host. A wildcard or `re:` in `env` is plain text matching, with no same-machine detection.
+
+### Host aliases
+
+For names that can't be linked automatically, add a top-level `hosts` section to the rules file. Each name maps to its aliases, and the hook keeps the section when it rewrites the file:
+
+```json
+"hosts": {
+  "nas": ["192.168.2.15", "100.x.y.z", "Desktop-Win10"],
+  "linveo": ["git.zacaj.com", "zacaj.com"]
+}
+```
+
+This only takes effect once `Bash(ssh *)` is removed from the settings `ask` list. Otherwise that rule prompts for every ssh command no matter what the hook decides. Other remote tools like `scp`, `rsync` and `sftp` stay in `ask`.
 
 ## Automatic cleanup
 
