@@ -84,7 +84,7 @@ If the hook itself crashes before a command runs, it answers `ask` with the erro
 
 | Field | Values | Meaning |
 |---|---|---|
-| `decision` | `allow` / `ask` | `ask` means always prompt for this. Approving the prompt does *not* turn it into `allow`. Use it for things you'll usually say yes to but still want to see each time. |
+| `decision` | `allow` / `ask` / `deny` | `ask` means always prompt for this. Approving the prompt does *not* turn it into `allow`. Use it for things you'll usually say yes to but still want to see each time. `deny` blocks the command outright, without a prompt; the agent is told why. |
 | `kind` | `cmd`, `script`, `inline`, `pkill`, `container` | What `match` describes (see below). A rule only applies to parts of the same kind. |
 | `match` | text with `*` / `*$` wildcards, or `re:<regex>` | See [Matching](#matching). |
 | `session` | session id or `"*"` | `"*"` means every session. |
@@ -140,10 +140,11 @@ For `cmd`, `pkill` and `script` rules, `match` is compared against the whole of 
 |---|---|
 | plain text | exact match |
 | `*` | any run of **non-whitespace** characters, including none. It stays inside one word, path or flag value. `/` is fine, so `/a/*` matches `/a/b/c`. |
-| `*$` at the very end | anything to the end of the part, including spaces |
+| `**` | any text **including spaces**, anywhere in the pattern. ` ** ` between two spaces can also match nothing, so `a ** b` matches `a b`. |
+| `*$` at the very end | same as a trailing `**` |
 | `re:<regex>` | Python regex that has to match the whole part (or the whole container key) |
 
-Everything else is literal: `?` and `[...]` have no special meaning. For a wildcard in the middle that has to cross spaces, use `re:`.
+Everything else is literal: `?` and `[...]` have no special meaning. Use `**` sparingly in `allow` rules, because it can swallow extra arguments such as another `-v` mount or a `-exec`. It's mainly for `deny` and `ask` rules that look for something anywhere in a command.
 
 ### Container rules
 
@@ -191,10 +192,13 @@ When several rules match a part, the most specific one decides. Specificity is c
 
 If an `allow` and an `ask` rule are equally specific, **`ask` wins**.
 
+**`deny` always wins.** If any `deny` rule matches, the command is blocked, however specific the matching `allow` or `ask` rules are. That way a narrow `allow` can't override a safety deny.
+
 Examples:
 - a global `ask` plus an `allow` for one session → allowed in that session, asked everywhere else
 - an `ask` for a path plus an `allow` for one session → allowed in that session, because session is compared first
 - in one scope, `allow sudo rm *$` plus `ask sudo rm -rf /var/tmp/important` → that one path asks, everything else is allowed
+- `allow sudo find /var/tmp/*$` plus a global `deny sudo find ** -exec**` (and `deny sudo find ** -delete**`) → read-only finds under `/var/tmp` are allowed, and any `-exec`/`-execdir`/`-delete` is blocked
 
 ## SSH
 

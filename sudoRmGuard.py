@@ -113,21 +113,50 @@ def realRoots():
 
 def stripHeredocs(cmd):
     """Remove heredoc bodies. Returns (cmd, [(lineBeforeBody, body)])."""
+    # Scan with quote tracking so "<<" inside quoted text (python's `x << 20`, a regex)
+    # isn't taken for a heredoc. Quotes can span lines (python -c "...multi-line...").
     bodies, out = [], []
     lines = cmd.split("\n")
+    quote = None
     i = 0
     while i < len(lines):
         line = lines[i]
         out.append(line)
-        tags = re.findall(r"<<-?\s*(['\"]?)(\w+)\1", line)
+        tags = []
+        k = 0
+        while k < len(line):
+            c = line[k]
+            if quote:
+                if c == "\\" and quote == '"':
+                    k += 2
+                    continue
+                if c == quote:
+                    quote = None
+            elif c == "\\":
+                k += 2
+                continue
+            elif c in "'\"":
+                quote = c
+            elif c == "#" and (k == 0 or line[k - 1] in " \t;&|("):
+                break  # shell comment: rest of line ignored
+            elif line.startswith("<<<", k):
+                k += 3  # here-string, not a heredoc
+                continue
+            elif line.startswith("<<", k):
+                m = re.match(r"<<-?\s*(['\"]?)([\w.-]+)\1", line[k:])
+                if m:
+                    tags.append(m.group(2))
+                    k += m.end()
+                    continue
+            k += 1
         i += 1
-        for _, tag in tags:
+        for tag in tags:
             body = []
             while i < len(lines) and lines[i].strip() != tag:
                 body.append(lines[i])
                 i += 1
             if i >= len(lines):
-                raise Ask("unterminated heredoc")
+                raise Ask(f"unterminated heredoc (<<{tag})")
             i += 1
             bodies.append((line, "\n".join(body)))
     return "\n".join(out), bodies
@@ -902,11 +931,12 @@ def textMatches(pattern, text):
 
 def globToRegex(pattern):
     """'*' = any run of non-whitespace (stays within one word/flag value);
-    a trailing '*$' = anything to the end of the command."""
-    tail = ""
+    '**' = any text including spaces; a trailing '*$' = same as a trailing '**'."""
     if pattern.endswith("*$"):
-        pattern, tail = pattern[:-2], ".*"
-    return r"\S*".join(re.escape(p) for p in pattern.split("*")) + tail
+        pattern = pattern[:-2] + "**"
+    one = lambda t: ".*".join(r"\S*".join(re.escape(p) for p in c.split("*")) for c in t.split("**"))
+    # " ** " may also match nothing: "a ** b" matches "a b"
+    return r"(?:\s.*\s|\s)".join(one(t) for t in pattern.split(" ** "))
 
 
 def containerMatches(pattern, key):
@@ -988,8 +1018,11 @@ def specificity(rule):
 
 
 def lookup(rules, part, session, project):
-    """Decision of the most specific matching rule ('allow'/'ask'), else None.
+    """'deny' if any matching deny rule (regardless of specificity); otherwise the
+    decision of the most specific matching rule ('allow'/'ask'), else None.
     Equally specific allow + ask -> 'ask'."""
+    if any(r.get("decision") == "deny" and ruleMatches(r, part, session, project) for r in rules):
+        return "deny"
     best, bestKey = None, None
     for r in rules:
         if r.get("decision") not in ("allow", "ask") or not ruleMatches(r, part, session, project):
@@ -1116,8 +1149,8 @@ def validateRules(data):
         if not isinstance(r, dict) or not isinstance(r.get("kind"), str) \
                 or not isinstance(r.get("match"), str):
             raise RulesFileError(f'rules[{i}] needs string "kind" and "match"')
-        if r.get("decision") not in ("allow", "ask"):
-            raise RulesFileError(f'rules[{i}] "decision" must be "allow" or "ask"')
+        if r.get("decision") not in ("allow", "ask", "deny"):
+            raise RulesFileError(f'rules[{i}] "decision" must be "allow", "ask" or "deny"')
         if r.get("match", "").startswith("re:"):
             try:
                 re.compile(r["match"][3:])
@@ -1276,6 +1309,8 @@ def decide(cmd, cwd, session="", data=None):
     except Ask as e:
         whole = Part("cmd", re.sub(r"\s+", " ", cmd).strip(), str(e))
         d = lookup(data["rules"], whole, session, project)
+        if d == "deny":
+            return "deny", f"sudo/rm guard: blocked by a deny rule ({e})", []
         if d == "allow":
             return None, f"sudo/rm guard: whole command allowed by rule ({e})", []
         return "ask", f"sudo/rm guard: {e}", [] if d == "ask" else [proposeRule(whole, session, project)]
@@ -1288,6 +1323,9 @@ def decide(cmd, cwd, session="", data=None):
             continue
         seen.add((part.kind, part.match, part.sha, part.env))
         d = lookup(data["rules"], part, session, project)
+        if d == "deny":
+            return "deny", f"sudo/rm guard: blocked by a deny rule: '{short(part.match, 120)}'" + \
+                (f" on {part.env}" if part.env else ""), []
         if d == "allow":
             continue
         if d == "ask":
