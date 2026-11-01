@@ -95,6 +95,7 @@ If the hook itself crashes before a command runs, it answers `ask` with the erro
 | `sudo` | `true` / `false` | **script, inline, pkill.** `true` covers the command with or without sudo. `false`, or a missing field, covers only the non-sudo form, so approving `python3 x.py` never approves `sudo python3 x.py`. |
 | `preview` | text | **inline rules only.** The start of the script, for your reference. Not used for matching. |
 | `at` | `YYYY-MM-DD HH:MM:SS` | When the rule was learned, in local time. Used for sorting and cleanup. |
+| `lastUsed` / `uses` | timestamp / count | Added by the hook the first time the rule decides a later call, whether it allowed, asked or denied, and updated on each use after that. A brand-new rule has neither, so a rule without them has never been used since it was learned. Duplicate parts within one call count once. Safe to edit or delete. |
 
 ### Kinds
 

@@ -1021,16 +1021,53 @@ def lookup(rules, part, session, project):
     """'deny' if any matching deny rule (regardless of specificity); otherwise the
     decision of the most specific matching rule ('allow'/'ask'), else None.
     Equally specific allow + ask -> 'ask'."""
-    if any(r.get("decision") == "deny" and ruleMatches(r, part, session, project) for r in rules):
-        return "deny"
-    best, bestKey = None, None
+    for r in rules:
+        if r.get("decision") == "deny" and ruleMatches(r, part, session, project):
+            USED_RULES.append(r)
+            return "deny"
+    best, bestRule, bestKey = None, None, None
     for r in rules:
         if r.get("decision") not in ("allow", "ask") or not ruleMatches(r, part, session, project):
             continue
         k = specificity(r)
         if bestKey is None or k > bestKey or (k == bestKey and r.get("decision") == "ask"):
-            best, bestKey = r.get("decision"), k
+            best, bestRule, bestKey = r.get("decision"), r, k
+    if bestRule is not None:
+        USED_RULES.append(bestRule)
     return best
+
+
+# rules that decided something during the current decide() call (for lastUsed/uses)
+USED_RULES = []
+USAGE_FIELDS = ("lastUsed", "uses")
+
+
+def ruleIdentity(r):
+    return json.dumps({k: v for k, v in r.items() if k not in USAGE_FIELDS}, sort_keys=True)
+
+
+def recordUsage(used):
+    """Stamp lastUsed and bump uses on the rules that decided this call. Fields only
+    appear once a rule is used after being created."""
+    if not used:
+        return
+    ids = {}
+    for r in used:
+        ids[ruleIdentity(r)] = ids.get(ruleIdentity(r), 0) + 1
+    with Lock():
+        try:
+            rules = loadRules()
+        except RulesFileError:
+            return
+        changed = False
+        for r in rules["rules"]:
+            n = ids.get(ruleIdentity(r))
+            if n:
+                r["lastUsed"] = nowText()
+                r["uses"] = int(r.get("uses", 0)) + n
+                changed = True
+        if changed:
+            saveRules(rules)
 
 
 VALUE_SHORT_FLAGS = {"-v", "-u"}
@@ -1254,7 +1291,7 @@ def cleanupRules(rules):
 def saveRules(data):
     """Indented, fixed key order so the file is easy to hand-edit; sorted by date."""
     data["rules"] = cleanupRules(data["rules"])
-    order = ["decision", "kind", "match", "sha", "sudo", "session", "path", "env", "at", "from", "preview",
+    order = ["decision", "kind", "match", "sha", "sudo", "session", "path", "env", "at", "lastUsed", "uses", "from", "preview",
              "toolUseId", "cmd", "rules"]
 
     def ordered(r):
@@ -1298,7 +1335,9 @@ def shapeNote(cmd, ctx):
 
 
 def decide(cmd, cwd, session="", data=None):
-    """Returns (decision or None, reason, proposedRules)."""
+    """Returns (decision or None, reason, proposedRules). Rules that decided parts are
+    left in USED_RULES."""
+    USED_RULES.clear()
     if not INTEREST_RE.search(cmd):
         return None, "nothing guarded", []
     data = data if data is not None else loadRules()
@@ -1396,6 +1435,7 @@ def handlePre(data):
                 saveRecovery(rec)
     else:
         decision, reason, proposals = decide(cmd, data.get("cwd"), session, rules)
+        recordUsage(list(USED_RULES))
         if decision == "ask" and proposals and tid:
             with Lock():
                 rules, err = openRules()
