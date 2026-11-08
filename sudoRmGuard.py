@@ -53,15 +53,27 @@ SCRATCH_ROOTS = ["/tmp", os.path.join(HOME, "tmp")]
 INTERP_RE = re.compile(r"^(python[\d.]*|node|perl|ruby|bash|sh|zsh|dash)$")
 # cheap pre-filter: commands that can't contain anything guarded skip analysis
 INTEREST_RE = re.compile(
-    r"(^|[^\w.-])(sudo|rm|rmdir|docker|podman|ssh|python[\d.]*|node|perl|ruby|bash|sh|zsh|dash)(\s|$|;|\))"
+    r"(^|[^\w.-])(sudo|rm|rmdir|docker|podman|ssh|git|python[\d.]*|node|perl|ruby|bash|sh|zsh|dash)(\s|$|;|\))"
     r"|(^|[\s;&|(])\.?\.?/[\w./-]+")
 
 # sudo <cmd>: read-only commands, with args that would make them write rejected
 SAFE_SUDO = {"ls", "cat", "grep", "egrep", "zgrep", "head", "tail", "dmesg", "journalctl",
              "strings", "objdump", "readelf", "pgrep", "stat", "file", "wc", "du", "lsof",
              "ss", "lsblk", "blkid", "xxd", "hexdump", "od", "md5sum", "sha256sum", "id", "true",
-             "dmidecode"}
+             "dmidecode",
+             # more read-only tools (write-capable options are in SAFE_SUDO_BAD_ARGS)
+             "find", "readlink", "realpath", "tree", "cmp", "diff", "sha1sum", "sha512sum",
+             "b2sum", "cksum", "base64", "nl", "tac", "rg", "fgrep", "zcat", "xzcat", "bzcat",
+             "zstdcat", "lsattr", "getfacl", "getfattr", "getcap", "lspci", "lsusb", "lsmod",
+             "lscpu", "lsns", "nm", "jq", "column", "cut", "sort", "uniq", "df", "findmnt",
+             "ps", "pidof", "netstat", "whoami", "groups", "uname", "uptime", "free",
+             "basename", "dirname", "test", "[", "printenv", "sensors", "dumpe2fs", "debugfs"}
 SAFE_SUDO_BAD_ARGS = {
+    "find": re.compile(r"^-(exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$"),
+    "sort": re.compile(r"^(-o.*|--output.*)$"),
+    "tree": re.compile(r"^(-o.*|--output.*)$"),
+    "debugfs": re.compile(r"^-\w*w"),  # opens read-only unless -w
+    "diff": re.compile(r"^--?(output|to-file|from-file)"),
     "dmesg": re.compile(r"^-(\w*[cCDEn]\w*)$|^--(clear|read-clear|console-)"),
     "journalctl": re.compile(r"^--(vacuum|rotate|flush|relinquish|sync|setup-keys|update-catalog)"),
 }
@@ -265,6 +277,10 @@ class Ctx:
         self.heredocBodies = []
         self.sshHeredocs = []      # heredoc bodies whose command line mentions ssh
         self.nCommands = 0
+        self.gitAuth = set()       # {"commit", "push"} authorized by the user's last message
+        self.gitAsks = []          # git add/commit/push not authorized
+        self.grantCmds = []        # session-granted command patterns
+        self.rules = []
 
 
 def expandVars(s, ctx):
@@ -558,6 +574,10 @@ SIMPLE_WRAPPERS = {
 }
 
 
+# system dirs on sudo's secure_path: "/usr/bin/x" is the same command as "x"
+STD_BIN_DIRS = {"/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin", "/usr/local/sbin"}
+
+
 def stripWrappers(words):
     """Drop leading SIMPLE_WRAPPERS and their options; returns the wrapped command."""
     while words and os.path.basename(words[0]) in SIMPLE_WRAPPERS:
@@ -580,6 +600,8 @@ def stripWrappers(words):
         if positional is not None and i < len(words) and positional.fullmatch(words[i]):
             i += 1  # timeout DURATION
         words = words[i:]
+    if words and os.path.dirname(words[0]) in STD_BIN_DIRS:
+        words = [os.path.basename(words[0])] + words[1:]  # /usr/bin/chroot -> chroot
     return words
 
 
@@ -780,10 +802,37 @@ def checkSudo(words, ctx):
         return
     if name in SAFE_SUDO:
         bad = SAFE_SUDO_BAD_ARGS.get(name)
-        if not (bad and any(bad.search(a) for a in rest[1:])) \
-                and not any("$(" in a or "`" in a for a in rest[1:]):
+        positional = [a for a in rest[1:] if not a.startswith("-")]
+        if (bad and any(bad.search(a) for a in rest[1:])) or \
+                (name in ("xxd", "uniq") and len(positional) > 1):  # 2nd positional = output file
+            addCmdPart(words, f"'sudo {name}' with arguments that can write", ctx)
             return
+        if any("`" in a for a in rest[1:]) or commandSubstitutions(rest[1:]) is None:
+            addCmdPart(words, f"'sudo {name}' with a command substitution the guard can't parse", ctx)
+        # $(...) bodies are judged on their own by analyzeScript
+        return
     addCmdPart(words, f"'sudo {name}' is not on the read-only sudo list", ctx)
+
+
+def commandSubstitutions(args):
+    """Bodies of $(...) in args, or None if there are backticks or unbalanced parens."""
+    out = []
+    for a in args:
+        if "`" in a:
+            return None
+        i = a.find("$(")
+        while i >= 0:
+            depth, j = 0, i + 1
+            while j < len(a):
+                depth += {"(": 1, ")": -1}.get(a[j], 0)
+                if depth == 0:
+                    break
+                j += 1
+            if depth:
+                return None
+            out.append(a[i + 2:j])
+            i = a.find("$(", j)
+    return out
 
 
 def analyzeCommand(words, ctx, depth):
@@ -797,6 +846,11 @@ def analyzeCommand(words, ctx, depth):
         words = words[1:]
     if not words:
         return
+    if ctx.grantCmds and not ctx.remote:
+        text = joinWords(words)
+        if any(textMatches(p, text) for p in ctx.grantCmds) and \
+                lookup(ctx.rules, Part("cmd", text, ""), "", "") != "deny":
+            return
     if writesFile:
         ctx.allTrivial = False
     name = os.path.basename(words[0])
@@ -834,6 +888,10 @@ def analyzeCommand(words, ctx, depth):
 
     if name == "ssh":
         checkSsh(words, ctx, depth)
+        return
+
+    if name == "git":
+        checkGit(args, ctx)
         return
 
     if name == "eval":
@@ -882,6 +940,248 @@ def analyzeCommand(words, ctx, depth):
         ctx.allTrivial = False
 
 
+GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+# subcommand -> keyword that authorizes it (typed capitalized mid-sentence)
+GIT_KEYWORD = {"add": "commit", "commit": "commit", "push": "push", "branch": "branch",
+               "checkout": "branch", "switch": "branch", "stash": "stash", "fetch": "fetch",
+               "pull": "pull", "rebase": "rebase", "merge": "merge", "tag": "tag",
+               "remote": "remote"}
+# read-only; allowed alongside any authorized part
+GIT_READONLY = {"status", "log", "diff", "show", "blame", "rev-parse", "shortlog", "ls-files",
+                "merge-base", "describe", "rev-list", "ls-remote", "cat-file", "whatchanged"}
+# risky args per subcommand: always ask, even when authorized
+GIT_RISKY = {
+    "push": re.compile(r"^(-f|--force.*|--delete|-d|--mirror|--prune|--all|--tags|\+.*|:.*|.*:\+?)$"),
+    "branch": re.compile(r"^(-D|-d|--delete|-f|--force|-M|-C)$"),
+    "checkout": re.compile(r"^(-f|--force|-B|--orphan|\.|--)$"),
+    "switch": re.compile(r"^(-f|--force|--discard-changes|-C|--force-create|--orphan)$"),
+    "stash": re.compile(r"^(drop|clear)$"),
+    "fetch": re.compile(r"^(--prune.*|-p|-P|--force|-f|\+.*)$"),
+    "pull": re.compile(r"^(--force|-f|--rebase=i.*|-r=i.*)$"),
+    "rebase": re.compile(r"^(-i|--interactive|--exec|-x|--root)$"),
+    "tag": re.compile(r"^(-d|--delete|-f|--force)$"),
+    "remote": re.compile(r"^(remove|rm|set-url|rename|prune)$"),
+}
+def checkGit(args, ctx):
+    """git subcommands in GIT_KEYWORD need their keyword (e.g. "Commit") in the user's last
+    message; read-only ones are fine; anything else is left to settings rules."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in GIT_VALUE_OPTS else 1
+    sub, rest = (args[i], args[i + 1:]) if i < len(args) else (None, [])
+    if not ctx.remote and sub in GIT_READONLY:
+        return
+    if ctx.remote or sub not in GIT_KEYWORD:
+        ctx.allTrivial = False
+        return
+    need = GIT_KEYWORD[sub]
+    risky = GIT_RISKY.get(sub)
+    if need not in ctx.gitAuth:
+        ctx.gitAsks.append(f"git {sub} (not authorized: type '{need.capitalize()}' mid-sentence)")
+    elif risky and any(risky.match(a) for a in rest):
+        ctx.gitAsks.append(f"git {sub} with risky args")
+    elif sub == "checkout" and (ctx.cwd is None or any(
+            not a.startswith("-") and os.path.exists(os.path.join(ctx.cwd, a)) for a in rest)):
+        ctx.gitAsks.append("git checkout of a path (discards changes)")
+
+
+def lastUserText(transcriptPath):
+    """Text of the user's most recent typed message (not tool results, hook or system text)."""
+    try:
+        with open(transcriptPath, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 4_000_000))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except (OSError, TypeError):
+        return ""
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain") \
+                or d.get("isCompactSummary"):
+            continue
+        c = (d.get("message") or {}).get("content")
+        if isinstance(c, list):
+            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                continue
+            c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+        if not isinstance(c, str):
+            continue
+        c = stripInjected(c)
+        if c:
+            return c
+    return ""
+
+
+GIT_KEYWORDS = sorted({k.capitalize() for k in GIT_KEYWORD.values()})
+# Keyword, Keyword* (session grant) or Keyword-* (session revoke)
+GIT_AUTH_RE = re.compile(r"(?<![A-Za-z])(" + "|".join(GIT_KEYWORDS) + r")(-\*|\*)?(?![A-Za-z])")
+GIT_MARKER_RE = re.compile(r"(?<![A-Za-z])(" + "|".join(GIT_KEYWORDS) + r")(-\*|\*)(?![A-Za-z])")
+# [command pattern]* / [command pattern]-*  (only in a markers-only prompt)
+CMD_GRANT_RE = re.compile(r"\[([^\[\]]+)\](-\*|\*)")
+GRANT_TTL_DAYS = 14
+
+
+def stripInjected(text):
+    """Drop injected blocks and `code` spans (quoted text never authorizes anything)."""
+    text = re.sub(r"<(pasted_content|system-reminder|command-[\w-]+|local-command-[\w-]+)\b.*?</\1>",
+                  "", text or "", flags=re.S)
+    return re.sub(r"```.*?```|`[^`\n]*`", " ", text, flags=re.S).strip()
+
+
+def gitMarkers(text):
+    """[(keyword, suffix, atSentenceStart)] for each capitalized keyword."""
+    out = []
+    for m in GIT_AUTH_RE.finditer(text):
+        before = text[:m.start()].rstrip(" \t")
+        out.append((m.group(1).lower(), m.group(2) or "", not before or before[-1] in ".!?\n"))
+    return out
+
+
+def gitAuthFrom(text):
+    """This turn's authorizations: Keyword or Keyword* mid-sentence. A capital at a
+    sentence start is just grammar; quoted/emphasized words don't count either."""
+    auth = set()
+    for m in GIT_AUTH_RE.finditer(text):
+        before = text[:m.start()].rstrip(" \t")
+        if m.group(2) != "-*" and before and before[-1] not in ".!?\n\"'`*>":
+            auth.add(m.group(1).lower())
+    return auth
+
+
+def isMarkersOnly(text):
+    rest = GIT_MARKER_RE.sub(" ", CMD_GRANT_RE.sub(" ", text))
+    return bool(text.strip()) and not re.sub(r"[\s,;]", "", rest)
+
+
+def applyGrants(rules, session, gitAdd, gitDel, cmdAdd, cmdDel):
+    grants = rules.setdefault("grants", {})
+    g = grants.setdefault(session, {})
+    git = (set(g.get("git", [])) | gitAdd) - gitDel
+    cmds = [c for c in g.get("cmds", []) if c not in cmdDel]
+    cmds += [c for c in cmdAdd if c not in cmds]
+    g.update({"git": sorted(git), "cmds": cmds, "at": nowText()})
+    if not git and not cmds:
+        del grants[session]
+    return git, cmds
+
+
+def pruneGrants(grants):
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S",
+                           time.localtime(time.time() - GRANT_TTL_DAYS * 86400))
+    return {k: v for k, v in grants.items() if v.get("at", "") >= cutoff}
+
+
+def settingsAskPatterns(cwd):
+    """Bash(...) patterns from settings "ask" lists (user + project, best effort)."""
+    paths = [os.path.join(HOME, ".claude", f) for f in ("settings.json", "settings.local.json")]
+    if cwd:
+        paths += [os.path.join(cwd, ".claude", f) for f in ("settings.json", "settings.local.json")]
+    out = []
+    for path in paths:
+        try:
+            with open(path) as f:
+                ask = json.load(f).get("permissions", {}).get("ask", [])
+        except (OSError, ValueError, AttributeError):
+            continue
+        for r in ask:
+            m = re.fullmatch(r"Bash\((.*)\)", r.strip()) if isinstance(r, str) else None
+            if m:
+                out.append(m.group(1))
+    return out
+
+
+def literalPrefix(pattern):
+    """Text before the first wildcard (ask patterns: '*' or ':*'; grants: '*', re:)."""
+    if pattern.startswith("re:"):
+        return re.split(r"[\\.\[\](){}*+?|^$]", pattern[3:], 1)[0].strip()
+    return re.split(r":?\*", pattern, 1)[0].strip()
+
+
+def askConflicts(cwd, gitAdd, cmdAdd):
+    """Best guess: settings ask entries that would still prompt despite these grants."""
+    asks = settingsAskPatterns(cwd)
+    hits = []
+    for k in sorted(gitAdd):
+        subs = [s for s, kw in GIT_KEYWORD.items() if kw == k]
+        # only broad entries ("git push*"); narrower ones (force etc.) are meant to keep asking
+        hits += [a for a in asks if any(literalPrefix(a) in (f"git {s}", "git") for s in subs)
+                 and re.fullmatch(r"[\s*:]*", a[len(literalPrefix(a)):].strip())]
+    for c in cmdAdd:
+        cp = literalPrefix(c)
+        hits += [a for a in asks
+                 if (lambda ap: ap.startswith(cp) or cp.startswith(ap))(literalPrefix(a))]
+    hits = list(dict.fromkeys(hits))
+    if not hits:
+        return ""
+    return (" \u26a0 settings 'ask' may still prompt for some of these (an ask there overrides "
+            "the hook): " + ", ".join(f"Bash({h})" for h in hits[:8])
+            + (" \u2026" if len(hits) > 8 else ""))
+
+
+def promptBlock(reason):
+    print(json.dumps({"decision": "block", "reason": reason}))
+
+
+def promptContext(text):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                             "additionalContext": text}}))
+
+
+def handlePrompt(data):
+    """UserPromptSubmit: record session grants. A prompt that is only markers is recorded
+    and blocked (the agent never sees it); a keyword at a sentence start is ambiguous, so
+    that prompt is blocked with a reminder."""
+    text = stripInjected(data.get("prompt", ""))
+    session = data.get("session_id", "")
+    if not text or text[0] in "/!":
+        return
+    marks = gitMarkers(text)
+    markersOnly = isMarkersOnly(text)
+    if not markersOnly:
+        starts = sorted({k.capitalize() + suf for k, suf, st in marks if st})
+        if starts:
+            return promptBlock(
+                f"Not sent: '{', '.join(starts)}' at the start of a sentence is ambiguous (git "
+                "authorization keywords only count mid-sentence). Lowercase it if it isn't an "
+                "authorization, or move it mid-sentence, then resend.")
+    gitAdd = {k for k, suf, _ in marks if suf == "*"}
+    gitDel = {k for k, suf, _ in marks if suf == "-*"}
+    cmdAdd, cmdDel = [], []
+    if markersOnly:
+        for m in CMD_GRANT_RE.finditer(text):
+            pat = m.group(1).strip()
+            if pat.startswith("re:"):
+                try:
+                    re.compile(pat[3:])
+                except re.error as e:
+                    return promptBlock(f"Not recorded: bad regex in [{pat}]: {e}")
+            (cmdAdd if m.group(2) == "*" else cmdDel).append(pat)
+    if not (gitAdd or gitDel or cmdAdd or cmdDel):
+        return
+    with Lock():
+        rules, err = openRules()
+        if err:
+            msg = "⚠ grants not recorded: " + rulesFileWarning(err)
+            return promptBlock(msg) if markersOnly else promptContext(msg)
+        rules["grants"] = pruneGrants(rules.get("grants", {}))
+        git, cmds = applyGrants(rules, session, gitAdd, gitDel, cmdAdd, cmdDel)
+        saveRules(rules)
+    summary = "session grants now: " + (", ".join(
+        [k.capitalize() for k in sorted(git)] + [f"[{c}]" for c in cmds]) or "none") \
+        + askConflicts(data.get("cwd"), gitAdd, cmdAdd)
+    if markersOnly:
+        return promptBlock("✓ " + summary + " (not sent to the agent)")
+    used = sorted({k.capitalize() + suf for k, suf, _ in marks if suf})
+    promptContext(f"Permission markers in the user's message ({', '.join(used)}) were handled "
+                  "by the permission hook: Keyword* grants that git operation for the rest of "
+                  "this session, Keyword-* revokes it. They are not part of the request; read "
+                  f"the message as if they were plain words. {summary}.")
+
+
 def analyzeScript(cmd, ctx, depth=0):
     cmd, bodies = stripHeredocs(cmd)
     ctx.heredocBodies += [b for _, b in bodies]
@@ -891,11 +1191,14 @@ def analyzeScript(cmd, ctx, depth=0):
                 and re.search(r"(^|[\s;&|(])(bash|sh|zsh|dash|sudo)\b", line) \
                 and not re.search(r"\bssh\b", line):
             raise Ask("heredoc shell script containing sudo/rm")
-    for sub in re.findall(r"\$\(([^()]*)\)|`([^`]*)`", cmd):
-        s = sub[0] or sub[1]
-        if INTEREST_RE.search(s):
-            analyzeScript(s, ctx, depth + 1)
-            ctx.allTrivial = False
+    subs = re.findall(r"\$\(([^()]*)\)|`([^`]*)`", cmd)
+    if len(subs) < cmd.count("$(") + cmd.count("`") // 2:
+        ctx.allTrivial = False  # nested/unparsed substitution: leave to settings rules
+    for sub in subs:
+        # judged like any other command: a trivial one ($(ls x | head -1)) keeps allTrivial
+        if depth > 3:
+            raise Ask("nesting too deep")
+        analyzeScript(sub[0] or sub[1], ctx, depth + 1)
     cmds = splitCommands(tokenize(cmd))
     if depth == 0:
         ctx.nCommands += len(cmds)
@@ -1181,6 +1484,11 @@ def validateRules(data):
     if not isinstance(hosts, dict) or not all(
             isinstance(v, list) and all(isinstance(x, str) for x in v) for v in hosts.values()):
         raise RulesFileError('"hosts" must map a name to a list of aliases')
+    grants = data.get("grants", {})
+    if not isinstance(grants, dict) or not all(
+            isinstance(v, dict) and isinstance(v.get("git", []), list)
+            and isinstance(v.get("cmds", []), list) for v in grants.values()):
+        raise RulesFileError('"grants" must map a session id to {"git": [...], "cmds": [...]}')
     HOST_ALIASES[:] = [{k.lower(), *(x.lower() for x in v)} for k, v in hosts.items()]
     for i, r in enumerate(data["rules"]):
         if not isinstance(r, dict) or not isinstance(r.get("kind"), str) \
@@ -1302,6 +1610,7 @@ def saveRules(data):
         return out
     text = json.dumps({
         "hosts": data.get("hosts", {}),
+        "grants": data.get("grants", {}),
         "rules": [ordered(r) for r in sorted(data["rules"], key=lambda r: r.get("at", ""))],
         "pending": [ordered(p) for p in sorted(data["pending"], key=lambda p: p.get("at", ""))],
     }, indent=2, ensure_ascii=False) + "\n"
@@ -1334,15 +1643,19 @@ def shapeNote(cmd, ctx):
     return f"[{', '.join(bits)}; asking about:] " if bits else ""
 
 
-def decide(cmd, cwd, session="", data=None):
+def decide(cmd, cwd, session="", data=None, gitAuth=()):
     """Returns (decision or None, reason, proposedRules). Rules that decided parts are
     left in USED_RULES."""
     USED_RULES.clear()
-    if not INTEREST_RE.search(cmd):
-        return None, "nothing guarded", []
     data = data if data is not None else loadRules()
+    grant = data.get("grants", {}).get(session, {})
+    if not INTEREST_RE.search(cmd) and not grant.get("cmds"):
+        return None, "nothing guarded", []
     project = projectOf(cwd)
     ctx = Ctx(cwd)
+    ctx.gitAuth = set(gitAuth) | set(grant.get("git", []))
+    ctx.grantCmds = grant.get("cmds", [])
+    ctx.rules = data["rules"]
     try:
         analyzeScript(cmd, ctx)
     except Ask as e:
@@ -1373,6 +1686,7 @@ def decide(cmd, cwd, session="", data=None):
             why = explainPart(part, data["rules"], session, project)
             asks.append(part.desc + (f" ({why})" if why else ""))
             proposals.append(proposeRule(part, session, project))
+    asks += ctx.gitAsks
     if asks:
         return "ask", "sudo/rm guard: " + shapeNote(cmd, ctx) + "; ".join(asks), proposals
     if ctx.allTrivial:
@@ -1418,12 +1732,16 @@ def handlePre(data):
     cmd = (data.get("tool_input") or {}).get("command", "")
     session = data.get("session_id", "")
     tid = data.get("tool_use_id")
+    gitAuth = gitAuthFrom(lastUserText(data.get("transcript_path"))) \
+        if re.search(r"\bgit\b", cmd) else set()
     with Lock():
         rules, err = openRules()
+    if err and data.get("permission_mode") == "bypassPermissions":
+        return  # can't check deny rules; skip-permissions means no prompts
     if err:
         # unusable rules file: ask about everything, but still record what we'd propose
         # so an approval now can be learned once the file is fixed
-        _, reason, proposals = decide(cmd, data.get("cwd"), session, emptyRules())
+        _, reason, proposals = decide(cmd, data.get("cwd"), session, emptyRules(), gitAuth)
         decision = "ask"
         reason = rulesFileWarning(err) + (reason or "")
         if proposals and tid:
@@ -1434,8 +1752,10 @@ def handlePre(data):
                 rec["pending"] = prunePending(rec["pending"])
                 saveRecovery(rec)
     else:
-        decision, reason, proposals = decide(cmd, data.get("cwd"), session, rules)
+        decision, reason, proposals = decide(cmd, data.get("cwd"), session, rules, gitAuth)
         recordUsage(list(USED_RULES))
+        if decision == "ask" and data.get("permission_mode") == "bypassPermissions":
+            return  # skip-permissions session: a hook "ask" would still prompt; deny still applies
         if decision == "ask" and proposals and tid:
             with Lock():
                 rules, err = openRules()
@@ -1503,7 +1823,8 @@ def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--test":
         cwd = sys.argv[3] if len(sys.argv) > 3 else os.getcwd()
         try:
-            d, reason, props = decide(sys.argv[2], cwd, "test")
+            d, reason, props = decide(sys.argv[2], cwd, "test",
+                                      gitAuth=os.environ.get("GIT_AUTH", "").split())
         except RulesFileError as e:
             d, reason, props = "ask", rulesFileWarning(e), []
         print(d, "|", reason)
@@ -1514,6 +1835,9 @@ def main():
         data = json.load(sys.stdin)
     except Exception:
         return
+    if data.get("hook_event_name") == "UserPromptSubmit":
+        handlePrompt(data)
+        return
     if data.get("tool_name") != "Bash":
         return
     if data.get("hook_event_name", "").startswith("PostToolUse"):
@@ -1522,6 +1846,8 @@ def main():
     try:
         handlePre(data)
     except Exception as e:  # never let a crash fall through to "no decision"
+        if data.get("permission_mode") == "bypassPermissions":
+            return
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "ask",

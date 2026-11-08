@@ -32,6 +32,10 @@ What the hook can't do:
 - Answer `allow` when a settings `ask` rule matches. The `ask` rule wins.
 - Add a "don't ask again" option to the prompt. Remembering approvals is handled by this rules file instead.
 
+**Skip-permissions sessions** (`permission_mode: bypassPermissions`): the hook never
+returns `ask` (a hook ask would still prompt there), and nothing is added to `pending`.
+`deny` rules still block. With a broken rules file the hook stays silent in this mode.
+
 ## Learning from approvals
 
 1. When the hook asks, it writes a `pending` entry: the call id, the command, and the rules it proposes.
@@ -115,6 +119,7 @@ Inline scripts are only guarded under `sudo`. A plain `python3 -c` or heredoc go
 - `2>&1`, `>/dev/null`, `2>/dev/null` and `&>/dev/null` are removed.
 - Known variables (`S=…; rm $S/x`) and `~` are expanded.
 - Wrappers that only change how a command runs are removed along with their options, both before and after `sudo`: `timeout` (with its duration), `nice`, `ionice`, `stdbuf`, `nohup`, `setsid`, `time`, `command` and `env`. `sudo timeout 30 chroot …` and `sudo timeout -k 5 90s chroot …` both become `sudo chroot …`, so a changing timeout doesn't break the rule. `sudo env VAR=x …` assignments are removed too. Assignments written directly after sudo (`sudo VAR=x cmd`) are kept.
+- A command given by full path in a system bin dir (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/usr/local/bin`, `/usr/local/sbin`) is shortened to its name: `sudo /usr/bin/chroot …` → `sudo chroot …`. Other paths (`/opt/x/chroot`) are kept.
 - `rm` paths are made absolute, taking any earlier `cd` in the same command into account.
 - An `rm` with several paths becomes one rule per path, with the same flags on each. Paths inside the scratch folders get no rule, except under `sudo`. For example, `rm -f a b` gives `rm -f /abs/a` and `rm -f /abs/b`, and each one can be allowed or widened on its own.
 - Extra whitespace is collapsed.
@@ -233,6 +238,58 @@ For names that can't be linked automatically, add a top-level `hosts` section to
 ```
 
 This only takes effect once `Bash(ssh *)` is removed from the settings `ask` list. Otherwise that rule prompts for every ssh command no matter what the hook decides. Other remote tools like `scp`, `rsync` and `sftp` stay in `ask`.
+
+## git authorization keywords
+
+Some git subcommands are allowed only when your most recent typed message contains their
+keyword, **capitalized and not at the start of a sentence** (start of message, or after
+`.` `!` `?` or a newline). "ok lets Commit that" → yes; "Commit that", "lets commit that",
+"I Committed it" → no, you get prompted.
+
+| Keyword | Allows | Always asks anyway |
+|---|---|---|
+| Commit | `add`, `commit` | |
+| Push | `push` | `-f`/`--force*`, `--delete`/`-d`, `--mirror`, `--prune`, `--all`, `--tags`, `+ref`, `:ref` |
+| Branch | `branch`, `checkout`, `switch` | branch `-D`/`-d`/`-f`/`-M`/`-C`; checkout `-f`/`-B`/`--orphan`/`.`/`--` or an existing path; switch `-f`/`-C`/`--discard-changes`/`--orphan` |
+| Stash | `stash` | `drop`, `clear` |
+| Fetch | `fetch` | `--prune*`/`-p`/`-P`, `--force`/`-f`, `+ref` |
+| Pull | `pull` | `--force`/`-f`, interactive rebase |
+| Rebase | `rebase` | `-i`, `--exec`/`-x`, `--root` |
+| Merge | `merge` | |
+| Tag | `tag` | `-d`, `-f` |
+| Remote | `remote` | `remove`/`rm`, `set-url`, `rename`, `prune` |
+
+Read-only subcommands (`status`, `log`, `diff`, `show`, `blame`, `rev-parse`, `ls-files`,
+`merge-base`, `describe`, …) never need a keyword and don't block approving a compound
+command. Other git subcommands are left to settings. One message can carry several
+keywords ("okay, Stash it and Rebase, then Push"); they last until your next message.
+
+Only your own typed text counts: tool results, hook/system text and `<pasted_content>`
+are ignored. Nothing is learned from these prompts. Settings `deny` rules still win.
+Requires the matching `git …` entries to be removed from settings `ask` (an `ask` there
+overrides the hook).
+
+Test: `GIT_AUTH="commit push" python3 sudoRmGuard.py --test "git commit -m x && git push"`
+
+### Session grants (`Keyword*`, `Keyword-*`, `[pattern]*`)
+
+The same hook also runs on `UserPromptSubmit`:
+
+| You type | Effect |
+|---|---|
+| `Keyword*` mid-sentence ("can you Commit* these separately?") | grants that keyword for the rest of the session; the agent gets a note that the marker isn't part of the request |
+| `Keyword-*` mid-sentence | revokes it |
+| a prompt that is **only** markers (`Commit* Rebase*`, `Push-*`, `[docker run*$]*`, `[npm publish]-*`) | recorded, then the prompt is **blocked** with a "✓ session grants now: …" message, so the agent never sees it |
+| `[pattern]*` / `[pattern]-*` | (markers-only prompts) allow/stop allowing any command matching `pattern` (same syntax as `match`: `*`, `**`, `*$`, `re:`) for this session. Matched per simple command; `deny` rules still win; local only (not over ssh) |
+| a keyword (any suffix) at the **start of a sentence** in a normal prompt | prompt is blocked with a reminder (could be ordinary capitalization); lowercase it or move it mid-sentence and resend |
+
+Several markers can go in one prompt (`[cmd1]* [cmd2]-* Commit* Push-*`). Markers inside
+`code` spans or ``` blocks never count (so you can quote the syntax). Prompts starting with `/` or `!` are ignored. Grants are stored per session in the rules
+file's top-level `grants` (`{session: {"git": [...], "cmds": [...], "at": ...}}`, hand-editable)
+and dropped after 14 days of no changes. A hook `allow` still can't override a settings `ask`. When you add a grant, the
+confirmation/note warns (best guess, by comparing the text before the first wildcard) about
+settings `ask` entries (user + project `settings*.json`) that would still prompt; for
+`Keyword*` only broad entries like `git push*` are reported, not the force/delete ones.
 
 ## Automatic cleanup
 
