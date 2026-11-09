@@ -6,7 +6,7 @@ versions of the guard can be compared:
 
     tools/replay.py --guard old/sudoRmGuard.py --rules snapshot.json > old.jsonl
     tools/replay.py --guard . --rules snapshot.json > new.jsonl
-    diff old.jsonl new.jsonl
+    tools/compare.py old.jsonl new.jsonl
 
 Nothing is written to the rules files: decide() gets the rules data directly and the
 archive path is pointed at a missing file. Exceptions are reported as decision "ERROR".
