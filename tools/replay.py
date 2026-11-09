@@ -5,7 +5,7 @@ Writes one JSON line per unique (command, cwd) with the decision and reason, so 
 versions of the guard can be compared:
 
     tools/replay.py --guard old/sudoRmGuard.py --rules snapshot.json > old.jsonl
-    tools/replay.py --guard zag.py --rules snapshot.json > new.jsonl
+    tools/replay.py --guard . --rules snapshot.json > new.jsonl
     diff old.jsonl new.jsonl
 
 Nothing is written to the rules files: decide() gets the rules data directly and the
@@ -20,11 +20,19 @@ import sys
 
 
 def loadGuard(path):
+    """A single-file guard (old layout), or a checkout containing the zag package."""
+    path = os.path.abspath(path)
+    if os.path.isdir(os.path.join(path, "zag")):
+        sys.path.insert(0, path)
+        import zag.hook
+        import zag.storage
+        zag.hook.validateRules = zag.storage.validateRules
+        return zag.hook, [zag.hook, zag.storage]
     spec = importlib.util.spec_from_file_location("guard_under_test", path)
     mod = importlib.util.module_from_spec(spec)
-    sys.path.insert(0, os.path.dirname(os.path.abspath(path)))
+    sys.path.insert(0, os.path.dirname(path))
     spec.loader.exec_module(mod)
-    return mod
+    return mod, [mod]
 
 
 def commands(projectsDir):
@@ -57,14 +65,15 @@ def commands(projectsDir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--guard", required=True, help="guard module file to load")
+    ap.add_argument("--guard", required=True, help="old single-file guard, or a checkout dir with zag/")
     ap.add_argument("--rules", required=True, help="rules JSON snapshot (with rules.d merged in)")
     ap.add_argument("--projects", default=os.path.expanduser("~/.claude/projects"))
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
-    g = loadGuard(args.guard)
-    g.ARCHIVE_PATH = "/nonexistent/archive.json"
+    g, mods = loadGuard(args.guard)
+    for m in mods:
+        m.ARCHIVE_PATH = "/nonexistent/archive.json"
     with open(args.rules) as f:
         data = json.load(f)
     validate = getattr(g, "validateRules")
