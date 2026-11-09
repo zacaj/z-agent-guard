@@ -307,7 +307,17 @@ def absPath(p, ctx):
         if ctx.cwd is None:
             raise Ask("relative path with unknown cwd")
         p = os.path.join(ctx.cwd, p)
-    return os.path.normpath(p) if not (set(p) & GLOB_CHARS) else p
+    if set(p) & GLOB_CHARS:
+        return p
+    # keep a trailing "/" : "rm -r link/" descends into the link's target
+    return os.path.normpath(p) + ("/" if re.search(r"/\.?$", p) and p.strip("/") else "")
+
+
+def belowTmp(path):
+    """True if path is strictly inside a directory named tmp (/tmp/x, /var/tmp/x,
+    /var/tmp/chroot/tmp/x, ~/tmp/x), not the tmp dir itself."""
+    parts = [p for p in path.split("/") if p]
+    return any(c == "tmp" for c in parts[:-1])
 
 
 def isUnderRootRemote(path):
@@ -322,7 +332,7 @@ def isUnderRootRemote(path):
     else:
         target = os.path.dirname(os.path.normpath(path)) + "/" + os.path.basename(os.path.normpath(path))
         target = os.path.normpath(target)
-    return any(target.startswith(r + "/") for r in ("/tmp", "~/tmp"))
+    return belowTmp(target) and ".." not in target.split("/")
 
 
 def isUnderRoot(path):
@@ -335,12 +345,16 @@ def isUnderRoot(path):
         base = head if head.endswith("/") else os.path.dirname(head)
         target = os.path.realpath(base)
         # strictly below a root: "rm /tmp/*" would hit other programs' files
-        return any(target.startswith(r + "/") for r in realRoots())
+        return any(target.startswith(r + "/") for r in realRoots()) or belowTmp(target)
     norm = os.path.normpath(path)
-    # don't follow the final component (rm removes the link, not its target)
-    parent = os.path.realpath(os.path.dirname(norm))
-    full = os.path.join(parent, os.path.basename(norm))
-    return any(full.startswith(r + "/") for r in realRoots())
+    if re.search(r"/\.?$", path):
+        # "link/" makes rm -r descend into the link's target: judge the target
+        full = os.path.realpath(norm)
+    else:
+        # don't follow the final component (rm removes the link, not its target)
+        parent = os.path.realpath(os.path.dirname(norm))
+        full = os.path.join(parent, os.path.basename(norm))
+    return any(full.startswith(r + "/") for r in realRoots()) or belowTmp(full)
 
 
 def sha(data):
@@ -372,13 +386,13 @@ def checkRm(words, ctx, prefix=()):
         addCmdPart(list(prefix) + words, f"{words[0]} with no paths", ctx)
         return
     # one rule per path, like compound commands: each target can be allowed on its own.
-    # Plain rm of scratch paths needs no rule; sudo rm always does.
+    # [sudo] rm of anything inside a */tmp/ dir (symlinks resolved) needs no rule.
     head = list(prefix) + [words[0]] + flags
     for p, a in zip(paths, absPaths):
         underRoot = isUnderRootRemote(a) if ctx.remote else isUnderRoot(a)
-        if not prefix and flagsOk and underRoot:
+        if flagsOk and underRoot:
             continue
-        where = "" if prefix else " (outside /tmp, ~/tmp)"
+        where = " (not inside a tmp dir)" if flagsOk else ""
         addCmdPart(head + [a], f"{joinWords(head)} {p}{where}", ctx)
 
 
@@ -1223,6 +1237,16 @@ def projectOf(cwd):
         d = parent
 
 
+def expandPlaceholders(pattern, project):
+    """{project} = the call's project dir (git root, else cwd), {home} = home dir."""
+    if "{" not in pattern:
+        return pattern
+    vals = {"{project}": (project or "/").rstrip("/") or "/", "{home}": HOME}
+    for k, v in vals.items():
+        pattern = pattern.replace(k, re.escape(v) if pattern.startswith("re:") else v)
+    return pattern
+
+
 def textMatches(pattern, text):
     if pattern.startswith("re:"):
         try:
@@ -1297,9 +1321,10 @@ def ruleMatches(rule, part, session, project):
         return False
     if part.kind == "script" and rule.get("sha", "*") not in ("*", part.sha):
         return False
+    match = expandPlaceholders(rule.get("match", ""), project)
     if part.kind == "container":
-        return containerMatches(rule.get("match", ""), part.match)
-    return textMatches(rule.get("match", ""), part.match)
+        return containerMatches(match, part.match)
+    return textMatches(match, part.match)
 
 
 def specificity(rule):

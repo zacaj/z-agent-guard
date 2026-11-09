@@ -17,8 +17,8 @@ The command is split into parts at `;`, `&&`, `||`, `|`, `&` and newlines. Each 
 
 | Group | Examples | What happens |
 |---|---|---|
-| **ok** | `echo`, `cd`, `ls`, `cat`, `grep`, `head`, `sleep`…; read-only `sudo` (`ls`, `cat`, `grep`, `tail`, `dmesg`, `journalctl`, `strings`, `objdump`, `pgrep`, `dmidecode`…); `rm` of paths strictly inside `/tmp` or `~/tmp`; `docker`/`podman` `ps`, `logs`, `inspect`, `images`, `compose ps`/`logs`… | fine |
-| **guarded** | other `sudo`; `rm` outside the scratch folders; running a script file; `docker`/`podman` `run`, `rm`, `rmi`, `prune`, `push`… | needs a rule |
+| **ok** | `echo`, `cd`, `ls`, `cat`, `grep`, `head`, `sleep`…; read-only `sudo` (`ls`, `cat`, `grep`, `tail`, `dmesg`, `journalctl`, `strings`, `objdump`, `pgrep`, `dmidecode`…); `rm`/`sudo rm` of paths strictly inside any directory named `tmp` (`/tmp/x`, `/var/tmp/x`, `/var/tmp/chroot/tmp/x`, `~/src/p/tmp/x`; symlinks resolved, `link/` judged by its target; `rm /var/tmp/*` itself is not inside); `docker`/`podman` `ps`, `logs`, `inspect`, `images`, `compose ps`/`logs`… | fine |
+| **guarded** | other `sudo`; `rm` outside a tmp dir; running a script file; `docker`/`podman` `run`, `rm`, `rmi`, `prune`, `push`… | needs a rule |
 | **deferred** | anything else | left to your settings rules and the auto-mode classifier |
 
 The hook's answer for the whole call:
@@ -105,7 +105,7 @@ If the hook itself crashes before a command runs, it answers `ask` with the erro
 
 | `kind` | Created for | `match` contains | Default scope when learned (plus the current `env`) |
 |---|---|---|---|
-| `cmd` | other `sudo`, `rm` outside the scratch folders, destructive docker commands, unparseable commands | the cleaned-up part (see below) | this session and project |
+| `cmd` | other `sudo`, `rm` outside a tmp dir, destructive docker commands, unparseable commands | the cleaned-up part (see below) | this session and project |
 | `script` | `python3 x.py`, `bash x.sh`, `node x.js`, `./x.sh`, `sudo python3 x.py`… | the script's absolute path, with `sha` set | this session and project |
 | `inline` | `sudo python3 -c '…'`, `sudo bash -c '…'`, `sudo python3 - <<EOF` | a hash of the script text | this session and project |
 | `pkill` | `sudo pkill [-SIG] [-x] NAME`, `sudo killall NAME` | `NAME`, or `-f PATTERN` for `pkill -f`. Any signal matches. | this session and project |
@@ -121,7 +121,7 @@ Inline scripts are only guarded under `sudo`. A plain `python3 -c` or heredoc go
 - Wrappers that only change how a command runs are removed along with their options, both before and after `sudo`: `timeout` (with its duration), `nice`, `ionice`, `stdbuf`, `nohup`, `setsid`, `time`, `command` and `env`. `sudo timeout 30 chroot …` and `sudo timeout -k 5 90s chroot …` both become `sudo chroot …`, so a changing timeout doesn't break the rule. `sudo env VAR=x …` assignments are removed too. Assignments written directly after sudo (`sudo VAR=x cmd`) are kept.
 - A command given by full path in a system bin dir (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/usr/local/bin`, `/usr/local/sbin`) is shortened to its name: `sudo /usr/bin/chroot …` → `sudo chroot …`. Other paths (`/opt/x/chroot`) are kept.
 - `rm` paths are made absolute, taking any earlier `cd` in the same command into account.
-- An `rm` with several paths becomes one rule per path, with the same flags on each. Paths inside the scratch folders get no rule, except under `sudo`. For example, `rm -f a b` gives `rm -f /abs/a` and `rm -f /abs/b`, and each one can be allowed or widened on its own.
+- An `rm` with several paths becomes one rule per path, with the same flags on each. Paths inside a tmp dir get no rule (with or without `sudo`). For example, `rm -f a b` gives `rm -f /abs/a` and `rm -f /abs/b`, and each one can be allowed or widened on its own.
 - Extra whitespace is collapsed.
 
 So `sudo chroot /var/tmp/jjp_run /usr/sbin/hasplmd_x86_64 -h 2>&1 | head -40` is stored as `sudo chroot /var/tmp/jjp_run /usr/sbin/hasplmd_x86_64 -h`. The `| head -40` part is ok on its own and gets no rule.
@@ -151,6 +151,15 @@ For `cmd`, `pkill` and `script` rules, `match` is compared against the whole of 
 | `re:<regex>` | Python regex that has to match the whole part (or the whole container key) |
 
 Everything else is literal: `?` and `[...]` have no special meaning. Use `**` sparingly in `allow` rules, because it can swallow extra arguments such as another `-v` mount or a `-exec`. It's mainly for `deny` and `ask` rules that look for something anywhere in a command.
+
+### Placeholders
+
+`{project}` (the call's project: git root above cwd, else cwd) and `{home}` are replaced
+before matching, in plain and `re:` patterns. The built-in deny rule uses it:
+`re:(sudo )?rm( -\S+)* (/(home|var|usr|etc|…)?/?\*?|{project}/?\*?)` denies `rm` of `/`,
+base system/home folders (`/etc`, `/var/home/zacaj`, `/var/tmp`, …, and their `/*`) and the
+project root itself; files inside them still just ask. Example allow for build output in
+any project: `{"decision": "allow", "kind": "cmd", "match": "rm -rf {project}/build", "path": "/", "session": "*"}`.
 
 ### Container rules
 
