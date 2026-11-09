@@ -4,7 +4,7 @@
 Writes one JSON line per unique (command, cwd) with the decision and reason, so two
 versions of the guard can be compared:
 
-    tools/replay.py --guard old/sudoRmGuard.py --rules snapshot.json > old.jsonl
+    tools/replay.py --guard old/sudoRmGuard.py   # single-file version --rules snapshot.json > old.jsonl
     tools/replay.py --guard . --rules snapshot.json > new.jsonl
     tools/compare.py old.jsonl new.jsonl
 

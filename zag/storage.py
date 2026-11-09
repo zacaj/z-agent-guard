@@ -200,7 +200,7 @@ def cleanupRules(rules):
 
 
 def saveRules(data):
-    """Write rules: big folders go to sudoRmGuard-rules.d/<folder>.json, the rest to the
+    """Write rules: big folders go to rules.d/<folder>.json, the rest to the
     main file. Hourly maintenance archives stale rules and marks superseded ones.
     Indented, fixed key order so the files are easy to hand-edit; sorted by date."""
     rules = cleanupRules(data["rules"])

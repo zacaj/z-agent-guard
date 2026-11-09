@@ -1,38 +1,21 @@
 #!/usr/bin/env python3
-"""Bash permission guard (PreToolUse + PostToolUse + PostToolUseFailure).
+"""z-agent-guard hook entry: PreToolUse / PostToolUse / PostToolUseFailure (Bash) and
+UserPromptSubmit. Full documentation: docs/z-agent-guard.md.
 
 Each Bash call is split into subcommands ("parts"). Each part is one of:
-- ok:      trivial (echo, cd, ...), read-only sudo, rm strictly inside /tmp or ~/tmp,
-           read-only docker/podman subcommands
+- ok:      trivial (echo, cd, ...), read-only sudo, rm inside a tmp dir, read-only
+           docker/podman/git subcommands, authorized git operations
 - defer:   anything else unguarded -> left to settings rules + auto-mode classifier
-- guarded: needs a rule in sudoRmGuard-rules.json:
-    script     running a script file (python3 x.py, bash x.sh, ./x.sh, sudo python3 x.py)
-               keyed by path + content sha
-    inline     sudo with an inline/heredoc script, keyed by script-text sha
-    pkill      sudo pkill/killall of a named process
-    container  [sudo] docker/podman run|create, keyed by privileges/mounts/image/command
-    cmd        any other sudo / rm / destructive docker part, keyed by normalized text
+- guarded: needs a rule (kinds: script, inline, pkill, container, cmd)
 
-Decision: any guarded part with no allow rule (or with an "ask" rule) -> "ask", and
-its proposed rules go to "pending". All guarded parts allowed + everything else ok
--> "allow". Allowed but some part deferred -> no output (a hook allow would approve
-the whole compound command).
-
-PostToolUse/PostToolUseFailure: the call ran, so the user approved the prompt; the
-pending entry's rules (with any decision the user edited in) move into "rules".
-
-Rules file (hand-editable):
-  decision  allow | ask   ("ask" keeps prompting even after you approve)
-  match     normalized command text; "*" = any non-whitespace run (one word/value);
-            trailing "*$" = rest of the command; "re:<regex>" = full-match regex.
-            container rules match piece-wise: each flag/mount must match a rule flag
-            (for script rules: the file path)
-  session   session id or "*";  path  project dir, a parent dir, or "/"
-  sha/sudo  script rules only; sha "*" = any content
+Any guarded part without an allow rule -> "ask", with proposed rules recorded as
+pending; PostToolUse learns them once the call ran (= the user approved). All parts
+allowed and everything else ok -> "allow". Some part deferred -> no output (a hook
+allow would approve the whole compound command). Any matching deny rule -> "deny".
 
 Unsure -> "ask". A parse bug should only ever cost an extra prompt.
 
-Test: python3 sudoRmGuard.py --test "<command>" [cwd]
+Test: python3 z-agent-guard.py --test "<command>" [cwd]
 """
 import json
 import os
@@ -85,12 +68,12 @@ def decide(cmd, cwd, session="", data=None, gitAuth=()):
         whole = Part("cmd", re.sub(r"\s+", " ", cmd).strip(), str(e))
         d = lookup(data["rules"], whole, session, project)
         if d == "deny":
-            return "deny", f"sudo/rm guard: blocked by a deny rule ({e})", []
+            return "deny", f"agent guard: blocked by a deny rule ({e})", []
         if d == "allow":
-            return None, f"sudo/rm guard: whole command allowed by rule ({e})", []
-        return "ask", f"sudo/rm guard: {e}", [] if d == "ask" else [proposeRule(whole, session, project)]
+            return None, f"agent guard: whole command allowed by rule ({e})", []
+        return "ask", f"agent guard: {e}", [] if d == "ask" else [proposeRule(whole, session, project)]
     except Exception as e:  # any bug -> ask, never allow
-        return "ask", f"sudo/rm guard error: {type(e).__name__}: {e}", []
+        return "ask", f"agent guard error: {type(e).__name__}: {e}", []
 
     asks, proposals, seen = [], [], set()
     for part in ctx.parts:
@@ -103,7 +86,7 @@ def decide(cmd, cwd, session="", data=None, gitAuth=()):
             d = lookup(loadArchive(), part, session, project)
             REVIVED.extend(USED_RULES[n:])
         if d == "deny":
-            return "deny", f"sudo/rm guard: blocked by a deny rule: '{short(part.match, 120)}'" + \
+            return "deny", f"agent guard: blocked by a deny rule: '{short(part.match, 120)}'" + \
                 (f" on {part.env}" if part.env else ""), []
         if d == "allow":
             continue
@@ -115,10 +98,10 @@ def decide(cmd, cwd, session="", data=None, gitAuth=()):
             proposals.append(proposeRule(part, session, project))
     asks += ctx.gitAsks
     if asks:
-        return "ask", "sudo/rm guard: " + shapeNote(cmd, ctx) + "; ".join(asks), proposals
+        return "ask", "agent guard: " + shapeNote(cmd, ctx) + "; ".join(asks), proposals
     if ctx.allTrivial:
-        return "allow", "sudo/rm guard: all guarded parts allowed", []
-    return None, "sudo/rm guard: guarded parts allowed; rest left to rules", []
+        return "allow", "agent guard: all guarded parts allowed", []
+    return None, "agent guard: guarded parts allowed; rest left to rules", []
 
 
 def handlePre(data):
@@ -221,7 +204,7 @@ def main():
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "ask",
-            "permissionDecisionReason": f"sudo/rm guard crashed ({type(e).__name__}: {e}); asking to be safe",
+            "permissionDecisionReason": f"agent guard crashed ({type(e).__name__}: {e}); asking to be safe",
         }}))
 
 
