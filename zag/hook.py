@@ -62,6 +62,7 @@ def decide(cmd, cwd, session="", data=None, gitAuth=()):
     ctx.gitAuth = set(gitAuth) | set(grant.get("git", []))
     ctx.grantCmds = grant.get("cmds", [])
     ctx.rules = data["rules"]
+    ctx.session, ctx.project = session, project
     try:
         analyzeScript(cmd, ctx)
     except Ask as e:

@@ -5,10 +5,16 @@ import re
 from .defaults import ASSIGN_RE, COMPOSE_READONLY, CONTAINER_DESTRUCTIVE, CONTAINER_READONLY, CONTAINER_TOOLS, EXEC_WRAPPERS, GIT_KEYWORD, GIT_READONLY, GIT_RISKY, GIT_VALUE_OPTS, GLOB_CHARS, GUARDED, HOME, INTEREST_RE, INTERP_RE, RUN_BOOL_FLAGS, RUN_DROP_VALUE, RUN_KEEP_FLAGS, RUN_KEEP_NETWORK_HOST, RUN_KEEP_VALUE, SAFE_SUDO, SAFE_SUDO_BAD_ARGS, SCRATCH_ROOTS, SHELLS, SIMPLE_WRAPPERS, SSH_FORWARD_OPTS, SSH_LOCAL_EXEC_OPTIONS, SSH_VALUE_OPTS, SUDO_OK_FLAGS, TRIVIAL
 from .util import sha
 from .parse import Ask, commandSubstitutions, joinWords, splitCommands, stripHeredocs, stripRedirects, stripWrappers, tokenize
-from .rules import lookup, textMatches
+from .rules import ruleMatches, textMatches
 
 
 # ---------------------------------------------------------------- parsing
+
+def isDenied(part, ctx):
+    """Whether a deny rule matches part (deny always wins, even where no rule is needed)."""
+    return any(r.get("decision") == "deny" and ruleMatches(r, part, ctx.session, ctx.project)
+               for r in ctx.rules)
+
 
 def realRoots():
     return [os.path.realpath(r) for r in SCRATCH_ROOTS]
@@ -39,6 +45,8 @@ class Ctx:
         self.gitAsks = []          # git add/commit/push not authorized
         self.grantCmds = []        # session-granted command patterns
         self.rules = []
+        self.session = ""
+        self.project = None
 
 
 def expandVars(s, ctx):
@@ -144,8 +152,8 @@ def checkRm(words, ctx, prefix=()):
     head = list(prefix) + [words[0]] + flags
     for p, a in zip(paths, absPaths):
         underRoot = isUnderRootRemote(a) if ctx.remote else isUnderRoot(a)
-        if flagsOk and underRoot:
-            continue
+        if flagsOk and underRoot and not isDenied(Part("cmd", joinWords(head + [a]), ""), ctx):
+            continue  # deny rules still win inside tmp dirs
         where = " (not inside a tmp dir)" if flagsOk else ""
         addCmdPart(head + [a], f"{joinWords(head)} {p}{where}", ctx)
 
@@ -453,7 +461,7 @@ def analyzeCommand(words, ctx, depth):
     if ctx.grantCmds and not ctx.remote:
         text = joinWords(words)
         if any(textMatches(p, text) for p in ctx.grantCmds) and \
-                lookup(ctx.rules, Part("cmd", text, ""), "", "") != "deny":
+                not isDenied(Part("cmd", text, ""), ctx):
             return
     if writesFile:
         ctx.allTrivial = False
