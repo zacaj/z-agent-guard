@@ -112,8 +112,8 @@ def settingsAskPatterns(cwd):
 def literalPrefix(pattern):
     """Text before the first wildcard (ask patterns: '*' or ':*'; grants: '*', re:)."""
     if pattern.startswith("re:"):
-        return re.split(r"[\\.\[\](){}*+?|^$]", pattern[3:], 1)[0].strip()
-    return re.split(r":?\*", pattern, 1)[0].strip()
+        return re.split(r"[\\.\[\](){}*+?|^$]", pattern[3:], maxsplit=1)[0].strip()
+    return re.split(r":?\*", pattern, maxsplit=1)[0].strip()
 
 
 def askConflicts(cwd, gitAdd, cmdAdd):
