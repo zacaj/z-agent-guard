@@ -149,3 +149,8 @@ ARCHIVED_SESSION_IDLE_DAYS = 7  # rule of a session archived in the desktop app
 RULE_KEY_ORDER = ["decision", "kind", "match", "sha", "sudo", "session", "path", "env", "at",
                   "lastUsed", "uses", "supersededBy", "archivedAt", "from", "preview",
                   "toolUseId", "cmd", "rules"]
+
+
+# per-machine overrides from config.json
+from .config import applyOverrides  # noqa: E402
+applyOverrides(globals())

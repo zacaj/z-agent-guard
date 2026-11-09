@@ -5,13 +5,15 @@ import os
 import re
 import time
 
-from .defaults import ARCHIVED_SESSION_IDLE_DAYS, ARCHIVE_IDLE_DAYS, ARCHIVE_MAX_USES, HOME, MAINT_INTERVAL, PENDING_MAX, PENDING_TTL, RULE_KEY_ORDER, SPLIT_MIN
+from . import config
+from .config import CONFIG_DIR, configHosts, desktopSessionsDir
+from .defaults import ARCHIVED_SESSION_IDLE_DAYS, ARCHIVE_IDLE_DAYS, ARCHIVE_MAX_USES, MAINT_INTERVAL, PENDING_MAX, PENDING_TTL, RULE_KEY_ORDER, SPLIT_MIN
 from .util import nowText, sha
 from .rules import HOST_ALIASES, containerMatches, ruleIdentity, textMatches
 
 
-HOOK_DIR = os.path.join(HOME, ".claude", "hooks")
-RULES_PATH = os.path.join(HOOK_DIR, "sudoRmGuard-rules.json")
+# all data lives in the per-machine config dir (see config.py)
+RULES_PATH = os.path.join(CONFIG_DIR, "rules.json")
 
 
 def recordUsage(used):
@@ -63,7 +65,9 @@ def validateRules(data):
             isinstance(v, dict) and isinstance(v.get("git", []), list)
             and isinstance(v.get("cmds", []), list) for v in grants.values()):
         raise RulesFileError('"grants" must map a session id to {"git": [...], "cmds": [...]}')
-    HOST_ALIASES[:] = [{k.lower(), *(x.lower() for x in v)} for k, v in hosts.items()]
+    # config.json hosts first; the rules file can add to or override them
+    allHosts = {**{k: v for k, v in configHosts().items() if isinstance(v, list)}, **hosts}
+    HOST_ALIASES[:] = [{k.lower(), *(str(x).lower() for x in v)} for k, v in allHosts.items()]
     validateRuleList(data["rules"], "rules")
     for i, p in enumerate(data["pending"]):
         if not isinstance(p, dict) or not isinstance(p.get("rules"), list) \
@@ -88,7 +92,9 @@ def validateRuleList(rules, label):
 
 def loadRules():
     """Returns the rules data. Raises RulesFileError if the file can't be used;
-    a missing file is just empty."""
+    a missing file is just empty. An unusable config.json counts as a broken file."""
+    if config.CONFIG_ERROR:  # read at call time: applyOverrides may set it
+        raise RulesFileError(f"config: {config.CONFIG_ERROR}")
     try:
         with open(RULES_PATH) as f:
             data = json.load(f)
@@ -115,13 +121,13 @@ def loadRules():
 
 # While the rules file is broken, new pending entries and approvals go here; they are
 # merged into the rules file the next time it loads cleanly.
-RECOVERY_PATH = os.path.join(HOOK_DIR, "sudoRmGuard-rules.recovery.json")
+RECOVERY_PATH = os.path.join(CONFIG_DIR, "rules.recovery.json")
 # folders with SPLIT_MIN+ rules get their own file here (by rule "path")
-RULES_DIR = os.path.join(HOOK_DIR, "sudoRmGuard-rules.d")
+RULES_DIR = os.path.join(CONFIG_DIR, "rules.d")
 # stale rules move here; still consulted, and a rule that decides a call moves back
-ARCHIVE_PATH = os.path.join(HOOK_DIR, "sudoRmGuard-rules.archive.json")
-MAINT_STAMP = os.path.join(HOOK_DIR, ".sudoRmGuard-maintenance")
-DESKTOP_SESSIONS_DIR = os.path.join(HOME, ".config", "Claude", "claude-code-sessions")
+ARCHIVE_PATH = os.path.join(CONFIG_DIR, "rules.archive.json")
+MAINT_STAMP = os.path.join(CONFIG_DIR, ".maintenance")
+DESKTOP_SESSIONS_DIR = desktopSessionsDir()
 
 
 def loadRecovery():
@@ -157,6 +163,7 @@ def mergeRecovery(rules):
 
 class Lock:
     def __enter__(self):
+        os.makedirs(os.path.dirname(RULES_PATH), exist_ok=True)
         self.f = open(RULES_PATH + ".lock", "w")
         fcntl.flock(self.f, fcntl.LOCK_EX)
         return self
