@@ -1,15 +1,68 @@
-# sudoRmGuard
+# z-agent-guard
 
-A Claude Code hook that decides Bash calls involving `sudo`, `rm`, `docker`/`podman` and script runs. It asks you the first time it sees one of these. After you approve, it remembers that in `sudoRmGuard-rules.json`, which you can edit by hand.
+A Claude Code hook that decides Bash calls involving `sudo`, `rm`, `docker`/`podman`, `ssh`, `git` and script runs. It asks you the first time it sees one of these. After you approve, it remembers that in a rules file you can edit by hand. It also handles git authorization keywords and session grants typed into your prompts.
+
+## Install
+
+```
+~/.claude/z-agent-guard/
+  app/                 git clone of this repo (deploy = git pull)
+  configs/<name>/      per-machine config + rules data
+```
+
+```bash
+git clone ssh://git@git.zacaj.com:222/zacaj/z-agent-guard.git ~/.claude/z-agent-guard/app
+```
+
+Register it in `~/.claude/settings.json` for `PreToolUse`, `PostToolUse` and `PostToolUseFailure` (matcher `Bash`) and `UserPromptSubmit` (no matcher), each with:
+
+```json
+{ "type": "command", "command": "python3 -I ~/.claude/z-agent-guard/app/z-agent-guard.py" }
+```
+
+Settings changes take effect in running sessions. Keep the dev checkout separate (e.g. `~/src/z-agent-guard`) and `git pull` into `app/` to deploy, so half-finished edits never run live. `app/` is a real directory, so bind-mounting `~/.claude` into a devcontainer works.
+
+Migrating from the old single-file `~/.claude/hooks/sudoRmGuard.py`: `tools/migrate.py --dry-run`, then without `--dry-run`, then switch the settings.json commands.
+
+## Config directory
+
+The guard uses one config dir, in this order:
+
+1. `$ZAG_CONFIG` (a directory)
+2. `configs/$ZAG_PROFILE`
+3. `configs/<hostname>`, if it exists
+4. `configs/default`, if it exists
+5. the only directory in `configs/`, if there's exactly one (devcontainers, whose hostname is random)
+6. `configs/<hostname>`, created on first save
+
+`configs/` is the sibling of `app/`; when running from elsewhere (a dev checkout) it's `~/.claude/z-agent-guard/configs`. Set `ZAG_PROFILE` in a devcontainer to pick a profile explicitly.
 
 | File | Purpose |
 |---|---|
-| `sudoRmGuard.py` | the hook |
-| `sudoRmGuard-rules.json` | saved rules and pending asks (edit freely) |
-| `sudoRmGuard-rules.json.lock` | lock file used while writing; ignore it |
-| `sudoRmGuard-rules.recovery.json` | only exists while the rules file is broken (see below) |
+| `config.json` | per-machine settings (below); optional, worth versioning |
+| `rules.json` | saved rules, pending asks and session grants (edit freely) |
+| `rules.d/<folder>.json` | rules of folders with many rules (see "Where rules are stored") |
+| `rules.archive.json` | stale rules, still consulted |
+| `rules.json.lock` | lock file used while writing; ignore it |
+| `rules.recovery.json` | only exists while the rules file is broken (see below) |
+| `.maintenance` | stamp for the hourly maintenance pass |
 
-The hook is registered in `~/.claude/settings.json` for `PreToolUse`, `PostToolUse` and `PostToolUseFailure`, all with matcher `Bash`. Settings changes take effect in running sessions.
+### config.json
+
+All keys optional:
+
+| Key | Effect |
+|---|---|
+| `hosts` | ssh host aliases, `{"name": ["alias", "ip", ...]}` (see "Host aliases"); merged with any `hosts` in rules.json |
+| `readOnlySudo` | extra commands allowed under sudo with any arguments, e.g. `["gdb"]` |
+| `trivialCommands` | extra commands that are ok alongside guarded parts |
+| `scratchRoots` | extra folders where `rm` needs no rule (any dir named `tmp` already counts) |
+| `pendingTtlSeconds`, `pendingMax` | pending expiry and cap |
+| `grantTtlDays` | session grant expiry |
+| `maintenanceIntervalSeconds`, `folderFileMinRules`, `archiveIdleDays`, `archiveMaxUses`, `archivedSessionIdleDays` | storage thresholds |
+| `desktopSessionsDir` | where the Claude desktop app keeps session metadata (archived-session detection) |
+
+A `config.json` that isn't valid is treated like a broken rules file: every call asks.
 
 ## How a call is decided
 
@@ -78,8 +131,8 @@ The hook rewrites the file in this layout: indented, fields in a fixed order, bo
 - a `re:` pattern doesn't compile.
 
 While the file is unusable:
-- **Every Bash call asks**, even `echo`. The reason starts with `⚠ sudoRmGuard-rules.json is unusable (<error, with line/column>)`.
-- The hook **never writes** to the broken file. New pending entries and approvals go to `sudoRmGuard-rules.recovery.json`.
+- **Every Bash call asks**, even `echo`. The reason starts with `⚠ rules.json is unusable (<error, with line/column>)`.
+- The hook **never writes** to the broken file. New pending entries and approvals go to `rules.recovery.json`.
 - The first time a hook run finds the file usable again, it merges the recovery data in and deletes the recovery file. Pending entries are added, and approvals given in the meantime become rules. It doesn't matter whether you fixed the file before or after answering the prompt. A denied prompt stays pending, as usual.
 
 If the hook itself crashes before a command runs, it answers `ask` with the error, rather than letting the call fall through to the other rules.
@@ -241,8 +294,8 @@ For names that can't be linked automatically, add a top-level `hosts` section to
 
 ```json
 "hosts": {
-  "nas": ["192.168.2.15", "100.x.y.z", "Desktop-Win10"],
-  "linveo": ["git.zacaj.com", "zacaj.com"]
+  "nas": ["192.168.1.10", "100.x.y.z", "nas-hostname"],
+  "vps": ["git.example.com", "example.com"]
 }
 ```
 
@@ -278,7 +331,7 @@ are ignored. Nothing is learned from these prompts. Settings `deny` rules still 
 Requires the matching `git …` entries to be removed from settings `ask` (an `ask` there
 overrides the hook).
 
-Test: `GIT_AUTH="commit push" python3 sudoRmGuard.py --test "git commit -m x && git push"`
+Test: `GIT_AUTH="commit push" python3 z-agent-guard.py --test "git commit -m x && git push"`
 
 ### Session grants (`Keyword*`, `Keyword-*`, `[pattern]*`)
 
@@ -313,9 +366,9 @@ Rules with `"sha": "*"` or a wildcard or `re:` in `match` are never removed auto
 
 | File | Holds |
 |---|---|
-| `sudoRmGuard-rules.json` | `hosts`, `grants`, `pending`, and rules for folders with fewer than 20 rules (and rules with no `path`) |
-| `sudoRmGuard-rules.d/<folder>.json` | `{"path": ..., "rules": [...]}` for each folder (`path` field) with 20+ rules. Once a folder file exists it keeps being used; it's deleted when its folder has no rules left |
-| `sudoRmGuard-rules.archive.json` | stale rules (below) |
+| `rules.json` | `hosts`, `grants`, `pending`, and rules for folders with fewer than 20 rules (and rules with no `path`) |
+| `rules.d/<folder>.json` | `{"path": ..., "rules": [...]}` for each folder (`path` field) with 20+ rules. Once a folder file exists it keeps being used; it's deleted when its folder has no rules left |
+| `rules.archive.json` | stale rules (below) |
 
 All of these are read on every call and are hand-editable; move a rule between them freely
 (the next save files it by its `path` again). A broken folder file or archive is treated
@@ -323,7 +376,7 @@ like a broken main file. Rules in different files are matched as one list.
 
 ### Hourly maintenance
 
-At most once an hour (stamp: `.sudoRmGuard-maintenance`), a save also:
+At most once an hour (stamp: `.maintenance`), a save also:
 
 - **Archives stale rules** into the archive file, stamping `archivedAt`. A rule is archived if
   it is an `allow`, not hand-widened (no `*`/`re:`/`{…}` in `match`, and not `session: "*"`,
@@ -341,13 +394,13 @@ At most once an hour (stamp: `.sudoRmGuard-maintenance`), a save also:
   everything this one does. Of two identical rules the newer is marked. Nothing is deleted;
   it's for manual cleanup. Marks are recomputed each maintenance pass.
 
-Thresholds are constants in `sudoRmGuard.py` (`SPLIT_MIN`, `ARCHIVE_IDLE_DAYS`,
+Thresholds are set in `config.json` (defaults in `zag/defaults.py`: `SPLIT_MIN`, `ARCHIVE_IDLE_DAYS`,
 `ARCHIVE_MAX_USES`, `ARCHIVED_SESSION_IDLE_DAYS`, `MAINT_INTERVAL`). Delete the stamp file
 to force a pass on the next save.
 
 ## Changing the built-in lists
 
-These are constants at the top of `sudoRmGuard.py`:
+These are constants in `zag/defaults.py`; `config.json` can extend some of them:
 
 | Constant | Controls |
 |---|---|
@@ -360,8 +413,24 @@ These are constants at the top of `sudoRmGuard.py`:
 
 ## Testing
 
+Unit tests (use temp config dirs, never touch your rules):
+
 ```bash
-python3 ~/.claude/hooks/sudoRmGuard.py --test 'sudo chroot /var/tmp/jjp_run /bin/sh -c id' /var/home/zacaj/src/pinball-asset-decryptor
+python3 -I -m unittest discover -s tests
+```
+
+Compare two versions on every Bash command in your transcripts (writes nothing):
+
+```bash
+tools/replay.py --guard <old checkout or old single file> --rules snapshot.json > old.jsonl
+tools/replay.py --guard . --rules snapshot.json > new.jsonl
+tools/compare.py old.jsonl new.jsonl
+```
+
+Check one command against your live config:
+
+```bash
+python3 ~/.claude/z-agent-guard/app/z-agent-guard.py --test 'sudo chroot /var/tmp/jjp_run /bin/sh -c id' /var/home/zacaj/src/pinball-asset-decryptor
 ```
 
 This prints the decision and reason, plus any rules it would propose. It uses your current rules file with session id `test`, and writes nothing.
