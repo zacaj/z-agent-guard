@@ -1,0 +1,115 @@
+{
+  "rules": [
+    {
+      "decision": "deny",
+      "kind": "cmd",
+      "match": "re:(sudo )?rm( -\\S+)* (/(home|var/home|var|usr|etc|bin|sbin|lib|lib64|boot|root|opt|srv|mnt|media|var/lib|tmp|var/tmp)?/?\\*?|{home}(/src)?/?\\*?|{project}/?\\*?)",
+      "sudo": true,
+      "session": "*",
+      "path": "/",
+      "env": "*",
+      "from": "starter: rm of /, base system folders, ~, ~/src or the project root itself"
+    },
+    {
+      "decision": "deny",
+      "kind": "cmd",
+      "match": "re:(sudo )?rm .*--no-preserve-root.*",
+      "sudo": true,
+      "session": "*",
+      "path": "/",
+      "env": "*",
+      "from": "starter"
+    },
+    {
+      "decision": "deny",
+      "kind": "cmd",
+      "match": "re:sudo find .* -(exec|execdir|ok|okdir|delete|fprint\\w*|fls)\\b.*",
+      "sudo": true,
+      "session": "*",
+      "path": "/",
+      "env": "*",
+      "from": "starter: root find that runs or deletes things"
+    },
+    {
+      "decision": "deny",
+      "kind": "cmd",
+      "match": "re:sudo mkfs\\S* .*",
+      "sudo": true,
+      "session": "*",
+      "path": "/",
+      "env": "*",
+      "from": "starter: creating a filesystem"
+    },
+    {
+      "decision": "deny",
+      "kind": "cmd",
+      "match": "re:sudo fdisk (?!(.* )?(-l|--list|-x|--list-details)( |$)).*",
+      "sudo": true,
+      "session": "*",
+      "path": "/",
+      "env": "*",
+      "from": "starter: fdisk other than listing (-l, -x)"
+    },
+    {
+      "decision": "deny",
+      "kind": "cmd",
+      "match": "re:sudo sfdisk (?!(.* )?(-l|--list|-d|--dump|-J|--json|-s|--show-size|-V|--verify|-g|--show-geometry)( |$)).*",
+      "sudo": true,
+      "session": "*",
+      "path": "/",
+      "env": "*",
+      "from": "starter: sfdisk other than listing/dumping"
+    },
+    {
+      "decision": "deny",
+      "kind": "cmd",
+      "match": "re:sudo parted (?!(-l|--list)$|(-s |--script )?\\S+ (unit \\S+ )?print( free| all)?$).*",
+      "sudo": true,
+      "session": "*",
+      "path": "/",
+      "env": "*",
+      "from": "starter: parted other than -l or '<dev> print'"
+    },
+    {
+      "decision": "deny",
+      "kind": "cmd",
+      "match": "re:sudo sgdisk (?!((-p|--print|-v|--verify|-i\\S*|--info\\S*|-O|--print-mbr) )*/\\S+$).*",
+      "sudo": true,
+      "session": "*",
+      "path": "/",
+      "env": "*",
+      "from": "starter: sgdisk other than -p/-v/-i/-O"
+    },
+    {
+      "decision": "deny",
+      "kind": "cmd",
+      "match": "re:sudo wipefs (?!(.* )?(-n|--no-act)( |$))(.* )?(-a|--all|-o\\S*|--offset\\S*|-\\w*a\\w*)( .*|$)",
+      "sudo": true,
+      "session": "*",
+      "path": "/",
+      "env": "*",
+      "from": "starter: wipefs that erases (plain wipefs only lists signatures)"
+    },
+    {
+      "decision": "deny",
+      "kind": "cmd",
+      "match": "re:sudo dd .*of=/dev/.*",
+      "sudo": true,
+      "session": "*",
+      "path": "/",
+      "env": "*",
+      "from": "starter: dd onto a device"
+    },
+    {
+      "decision": "deny",
+      "kind": "cmd",
+      "match": "re:sudo (chmod|chown|chgrp) (-\\S+ )*-\\S*R\\S* (\\S+ )?(/|/(etc|usr|var|home|bin|sbin|lib|boot)/?|{home}/?)",
+      "sudo": true,
+      "session": "*",
+      "path": "/",
+      "env": "*",
+      "from": "starter: recursive permission/ownership change of a base folder"
+    }
+  ],
+  "pending": []
+}

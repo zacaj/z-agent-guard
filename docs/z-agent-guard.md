@@ -11,8 +11,13 @@ A Claude Code hook that decides Bash calls involving `sudo`, `rm`, `docker`/`pod
 ```
 
 ```bash
+mkdir -p ~/.claude/z-agent-guard/configs
 git clone ssh://git@git.zacaj.com:222/zacaj/z-agent-guard.git ~/.claude/z-agent-guard/app
+cp -r ~/.claude/z-agent-guard/app/examples/config ~/.claude/z-agent-guard/configs/"$(hostname)"
 ```
+
+The starter config holds only generic `deny` rules (see the README). The hook snippet for
+settings.json is in `examples/settings-hooks.json`.
 
 Register it in `~/.claude/settings.json` for `PreToolUse`, `PostToolUse` and `PostToolUseFailure` (matcher `Bash`) and `UserPromptSubmit` (no matcher), each with:
 

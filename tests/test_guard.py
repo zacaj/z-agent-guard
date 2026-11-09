@@ -234,6 +234,30 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(self.guard('{"readOnlySudo": ["gdb"]}', "sudo gdb -p 1"), "allow")
         self.assertEqual(self.guard("{}", "sudo gdb -p 1"), "ask")
 
+    def test_starter_config(self):
+        cfg = os.path.join(ROOT, "examples", "config")
+        tmp = tempfile.mkdtemp(prefix="zag-starter-")
+        for name in ("config.json", "rules.json"):
+            with open(os.path.join(cfg, name)) as src, open(os.path.join(tmp, name), "w") as dst:
+                dst.write(src.read())
+        cases = {
+            "rm -rf ~": "deny", "sudo rm -rf /": "deny", "rm -rf /etc/": "deny", "rm -rf /usr/*": "deny",
+            "sudo rm --no-preserve-root -rf /x": "deny", "sudo find / -name x -delete": "deny",
+            "sudo mkfs.ext4 /dev/sdb1": "deny", "sudo dd if=x of=/dev/sda": "deny",
+            "sudo fdisk /dev/sda": "deny", "sudo fdisk -l": "ask", "sudo fdisk -l /dev/sda": "ask",
+            "sudo sfdisk /dev/sda": "deny", "sudo sfdisk -d /dev/sda": "ask",
+            "sudo parted /dev/sda mklabel gpt": "deny", "sudo parted -l": "ask",
+            "sudo parted -s /dev/sda unit MiB print": "ask", "sudo parted /dev/sda print free": "ask",
+            "sudo sgdisk -Z /dev/sda": "deny", "sudo sgdisk -p /dev/sda": "ask",
+            "sudo wipefs -a /dev/sda1": "deny", "sudo wipefs /dev/sda1": "ask", "sudo wipefs -n -a /dev/sda1": "ask",
+            "sudo chown -R me /etc": "deny", "rm -rf /tmp/x": "allow", "sudo find /var -name x": "allow",
+            "rm -rf /opt/x": "ask", "sudo chown -R me /opt/x": "ask", "sudo dd if=/dev/sda of=/tmp/img": "ask",
+        }
+        for cmd, want in cases.items():
+            out = subprocess.run([sys.executable, "-I", ENTRY, "--test", cmd], capture_output=True, text=True,
+                                 env={**os.environ, "ZAG_CONFIG": tmp}).stdout
+            self.assertEqual(out.split(" |")[0], want, cmd)
+
     def test_bad_config_asks(self):
         self.assertEqual(self.guard('{"readOnlySudo": "gdb"}', "sudo ls"), "ask")
 
