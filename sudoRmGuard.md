@@ -309,6 +309,42 @@ Every time the hook writes the file, it removes:
 
 Rules with `"sha": "*"` or a wildcard or `re:` in `match` are never removed automatically.
 
+## Where rules are stored
+
+| File | Holds |
+|---|---|
+| `sudoRmGuard-rules.json` | `hosts`, `grants`, `pending`, and rules for folders with fewer than 20 rules (and rules with no `path`) |
+| `sudoRmGuard-rules.d/<folder>.json` | `{"path": ..., "rules": [...]}` for each folder (`path` field) with 20+ rules. Once a folder file exists it keeps being used; it's deleted when its folder has no rules left |
+| `sudoRmGuard-rules.archive.json` | stale rules (below) |
+
+All of these are read on every call and are hand-editable; move a rule between them freely
+(the next save files it by its `path` again). A broken folder file or archive is treated
+like a broken main file. Rules in different files are matched as one list.
+
+### Hourly maintenance
+
+At most once an hour (stamp: `.sudoRmGuard-maintenance`), a save also:
+
+- **Archives stale rules** into the archive file, stamping `archivedAt`. A rule is archived if
+  it is an `allow`, not hand-widened (no `*`/`re:`/`{…}` in `match`, and not `session: "*"`,
+  `sha: "*"`, `env: "*"` or `path: "/"`), and either
+  - its session is **archived in the Claude desktop app** (`isArchived` in
+    `~/.config/Claude/claude-code-sessions/**/local_*.json`) and it's been unused 7+ days, or
+  - it's been unused 30+ days and has fewer than 3 `uses`.
+
+  "Unused" counts from `lastUsed`, else `at`. `deny`/`ask` rules are never archived.
+  The archive is still consulted when no live rule decides a part; an archived rule that
+  decides one moves back into the live rules (without `archivedAt`), with its use counted.
+- **Marks superseded rules** with `supersededBy: "<match of the covering rule>"`: another rule
+  with the same `kind` and `decision`, equal or wider scope (`session` same or `*`; `path`
+  same or a parent; `env` same or `*`; `sudo` and `sha` at least as broad) matches
+  everything this one does. Of two identical rules the newer is marked. Nothing is deleted;
+  it's for manual cleanup. Marks are recomputed each maintenance pass.
+
+Thresholds are constants in `sudoRmGuard.py` (`SPLIT_MIN`, `ARCHIVE_IDLE_DAYS`,
+`ARCHIVE_MAX_USES`, `ARCHIVED_SESSION_IDLE_DAYS`, `MAINT_INTERVAL`). Delete the stamp file
+to force a pass on the next save.
+
 ## Changing the built-in lists
 
 These are constants at the top of `sudoRmGuard.py`:

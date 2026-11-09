@@ -1367,7 +1367,8 @@ def lookup(rules, part, session, project):
 
 # rules that decided something during the current decide() call (for lastUsed/uses)
 USED_RULES = []
-USAGE_FIELDS = ("lastUsed", "uses")
+USAGE_FIELDS = ("lastUsed", "uses", "supersededBy", "archivedAt")  # not part of a rule's identity
+REVIVED = []  # archived rules that decided the current call
 
 
 def ruleIdentity(r):
@@ -1515,22 +1516,26 @@ def validateRules(data):
             and isinstance(v.get("cmds", []), list) for v in grants.values()):
         raise RulesFileError('"grants" must map a session id to {"git": [...], "cmds": [...]}')
     HOST_ALIASES[:] = [{k.lower(), *(x.lower() for x in v)} for k, v in hosts.items()]
-    for i, r in enumerate(data["rules"]):
-        if not isinstance(r, dict) or not isinstance(r.get("kind"), str) \
-                or not isinstance(r.get("match"), str):
-            raise RulesFileError(f'rules[{i}] needs string "kind" and "match"')
-        if r.get("decision") not in ("allow", "ask", "deny"):
-            raise RulesFileError(f'rules[{i}] "decision" must be "allow", "ask" or "deny"')
-        if r.get("match", "").startswith("re:"):
-            try:
-                re.compile(r["match"][3:])
-            except re.error as e:
-                raise RulesFileError(f"rules[{i}] bad regex: {e}")
+    validateRuleList(data["rules"], "rules")
     for i, p in enumerate(data["pending"]):
         if not isinstance(p, dict) or not isinstance(p.get("rules"), list) \
                 or not all(isinstance(r, dict) for r in p["rules"]):
             raise RulesFileError(f'pending[{i}] needs a "rules" list of objects')
     return data
+
+
+def validateRuleList(rules, label):
+    for i, r in enumerate(rules):
+        if not isinstance(r, dict) or not isinstance(r.get("kind"), str) \
+                or not isinstance(r.get("match"), str):
+            raise RulesFileError(f'{label}[{i}] needs string "kind" and "match"')
+        if r.get("decision") not in ("allow", "ask", "deny"):
+            raise RulesFileError(f'{label}[{i}] "decision" must be "allow", "ask" or "deny"')
+        if r.get("match", "").startswith("re:"):
+            try:
+                re.compile(r["match"][3:])
+            except re.error as e:
+                raise RulesFileError(f"{label}[{i}] bad regex: {e}")
 
 
 def loadRules():
@@ -1540,17 +1545,40 @@ def loadRules():
         with open(RULES_PATH) as f:
             data = json.load(f)
     except FileNotFoundError:
-        return emptyRules()
+        data = emptyRules()
     except ValueError as e:
         raise RulesFileError(f"invalid JSON: {e}")
     except OSError as e:
         raise RulesFileError(f"can't read: {e}")
-    return validateRules(data)
+    data = validateRules(data)
+    for path in folderFiles():
+        name = os.path.basename(path)
+        try:
+            with open(path) as f:
+                part = json.load(f)
+        except (OSError, ValueError) as e:
+            raise RulesFileError(f"{name}: {e}")
+        if not isinstance(part, dict) or not isinstance(part.get("rules"), list):
+            raise RulesFileError(f'{name}: needs a "rules" list')
+        validateRuleList(part["rules"], name)
+        data["rules"] += part["rules"]
+    return data
 
 
 # While the rules file is broken, new pending entries and approvals go here; they are
 # merged into the rules file the next time it loads cleanly.
 RECOVERY_PATH = os.path.join(HOOK_DIR, "sudoRmGuard-rules.recovery.json")
+# folders with SPLIT_MIN+ rules get their own file here (by rule "path")
+RULES_DIR = os.path.join(HOOK_DIR, "sudoRmGuard-rules.d")
+# stale rules move here; still consulted, and a rule that decides a call moves back
+ARCHIVE_PATH = os.path.join(HOOK_DIR, "sudoRmGuard-rules.archive.json")
+MAINT_STAMP = os.path.join(HOOK_DIR, ".sudoRmGuard-maintenance")
+MAINT_INTERVAL = 3600
+SPLIT_MIN = 20
+ARCHIVE_IDLE_DAYS = 30          # unused this long and used < ARCHIVE_MAX_USES times
+ARCHIVE_MAX_USES = 3
+ARCHIVED_SESSION_IDLE_DAYS = 7  # rule of a session archived in the desktop app
+DESKTOP_SESSIONS_DIR = os.path.join(HOME, ".config", "Claude", "claude-code-sessions")
 
 
 def loadRecovery():
@@ -1622,27 +1650,230 @@ def cleanupRules(rules):
 
 
 def saveRules(data):
-    """Indented, fixed key order so the file is easy to hand-edit; sorted by date."""
-    data["rules"] = cleanupRules(data["rules"])
-    order = ["decision", "kind", "match", "sha", "sudo", "session", "path", "env", "at", "lastUsed", "uses", "from", "preview",
-             "toolUseId", "cmd", "rules"]
-
-    def ordered(r):
-        out = {k: r[k] for k in order if k in r}
-        out.update({k: v for k, v in r.items() if k not in out})
-        if "rules" in out:
-            out["rules"] = [ordered(x) for x in out["rules"]]
-        return out
-    text = json.dumps({
+    """Write rules: big folders go to sudoRmGuard-rules.d/<folder>.json, the rest to the
+    main file. Hourly maintenance archives stale rules and marks superseded ones.
+    Indented, fixed key order so the files are easy to hand-edit; sorted by date."""
+    rules = cleanupRules(data["rules"])
+    if maintenanceDue():
+        rules = maintainRules(rules)
+    data["rules"] = rules
+    byPath = {}
+    for r in rules:
+        byPath.setdefault(r.get("path"), []).append(r)
+    folderRules, mainRules = {}, []
+    for path, rs in byPath.items():
+        if isinstance(path, str) and path and (len(rs) >= SPLIT_MIN or os.path.exists(folderFile(path))):
+            folderRules[path] = rs
+        else:
+            mainRules += rs
+    writeJson(RULES_PATH, {
         "hosts": data.get("hosts", {}),
         "grants": data.get("grants", {}),
-        "rules": [ordered(r) for r in sorted(data["rules"], key=lambda r: r.get("at", ""))],
-        "pending": [ordered(p) for p in sorted(data["pending"], key=lambda p: p.get("at", ""))],
-    }, indent=2, ensure_ascii=False) + "\n"
-    tmp = RULES_PATH + ".tmp"
+        "rules": orderedRules(mainRules),
+        "pending": [orderedRule(p) for p in sorted(data["pending"], key=lambda p: p.get("at", ""))],
+    })
+    keep = set()
+    for path, rs in folderRules.items():
+        f = folderFile(path)
+        keep.add(f)
+        writeJson(f, {"path": path, "rules": orderedRules(rs)})
+    for f in folderFiles():
+        if f not in keep:
+            os.remove(f)  # folder has no rules left
+
+
+RULE_KEY_ORDER = ["decision", "kind", "match", "sha", "sudo", "session", "path", "env", "at",
+                  "lastUsed", "uses", "supersededBy", "archivedAt", "from", "preview",
+                  "toolUseId", "cmd", "rules"]
+
+
+def orderedRule(r):
+    out = {k: r[k] for k in RULE_KEY_ORDER if k in r}
+    out.update({k: v for k, v in r.items() if k not in out})
+    if "rules" in out:
+        out["rules"] = [orderedRule(x) for x in out["rules"]]
+    return out
+
+
+def orderedRules(rules):
+    return [orderedRule(r) for r in sorted(rules, key=lambda r: r.get("at", ""))]
+
+
+def writeJson(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(tmp, RULES_PATH)
+        f.write(json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def folderFile(path):
+    slug = re.sub(r"[^\w.-]+", "_", path.strip("/")) or "root"
+    return os.path.join(RULES_DIR, slug + ".json")
+
+
+def folderFiles():
+    try:
+        return sorted(os.path.join(RULES_DIR, f) for f in os.listdir(RULES_DIR) if f.endswith(".json"))
+    except OSError:
+        return []
+
+
+# ---------------------------------------------------------------- maintenance
+
+def maintenanceDue():
+    try:
+        return time.time() - os.path.getmtime(MAINT_STAMP) > MAINT_INTERVAL
+    except OSError:
+        return True
+
+
+def maintainRules(rules):
+    """Archive stale rules and refresh supersededBy marks. Returns the remaining rules."""
+    try:
+        open(MAINT_STAMP, "a").close()
+        os.utime(MAINT_STAMP)
+    except OSError:
+        pass
+    try:
+        archive = loadArchive(strict=True)
+    except RulesFileError:
+        archive = None  # broken archive: don't add to it, keep everything live
+    if archive is not None:
+        archivedSessions = desktopArchivedSessions()
+        stay, moved = [], []
+        for r in rules:
+            (moved if shouldArchive(r, archivedSessions) else stay).append(r)
+        if moved:
+            for r in moved:
+                r["archivedAt"] = nowText()
+            writeJson(ARCHIVE_PATH, {"rules": orderedRules(archive + moved)})
+            rules = stay
+    markSuperseded(rules)
+    return rules
+
+
+def desktopArchivedSessions():
+    """CLI session ids the Claude desktop app shows as archived."""
+    out = set()
+    try:
+        files = [os.path.join(dp, f) for dp, _, fs in os.walk(DESKTOP_SESSIONS_DIR)
+                 for f in fs if f.startswith("local_") and f.endswith(".json")]
+    except OSError:
+        return out
+    for f in files:
+        try:
+            with open(f) as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and d.get("isArchived") and d.get("cliSessionId"):
+            out.add(d["cliSessionId"])
+    return out
+
+
+def isCustomized(r):
+    """Hand-widened rules are worth keeping even when idle."""
+    m = r.get("match", "")
+    return "*" in m or m.startswith("re:") or "{" in m or r.get("session") == "*" \
+        or r.get("sha") == "*" or r.get("env") == "*" or r.get("path") == "/"
+
+
+def idleDays(r):
+    stamp = r.get("lastUsed") or r.get("at") or ""
+    try:
+        t = time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return 0
+    return (time.time() - t) / 86400
+
+
+def shouldArchive(r, archivedSessions):
+    if r.get("decision") != "allow" or isCustomized(r):
+        return False
+    idle = idleDays(r)
+    if r.get("session") in archivedSessions and idle >= ARCHIVED_SESSION_IDLE_DAYS:
+        return True
+    return idle >= ARCHIVE_IDLE_DAYS and int(r.get("uses", 0)) < ARCHIVE_MAX_USES
+
+
+def pathCovers(outer, inner):
+    if outer == inner or outer == "/":
+        return True
+    return isinstance(outer, str) and isinstance(inner, str) and \
+        inner.startswith(outer.rstrip("/") + "/")
+
+
+def covers(o, r):
+    """o matches everything r matches, with equal or wider scope."""
+    if o.get("kind") != r.get("kind") or o.get("decision") != r.get("decision"):
+        return False
+    if "{" in o.get("match", "") or "{" in r.get("match", ""):
+        return False
+    if o.get("session") not in ("*", r.get("session")) or not pathCovers(o.get("path"), r.get("path")):
+        return False
+    if o.get("env") not in ("*", r.get("env")) or (r.get("sudo") and not o.get("sudo")):
+        return False
+    if o.get("sha", "*") not in ("*", r.get("sha")):
+        return False
+    if r.get("match", "").startswith("re:"):
+        return o.get("match") == r.get("match")
+    if r.get("kind") == "container":
+        return containerMatches(o.get("match", ""), r.get("match", ""))
+    return textMatches(o.get("match", ""), r.get("match", ""))
+
+
+def markSuperseded(rules):
+    """supersededBy = match of a rule that already covers this one (for manual cleanup).
+    Of two identical rules, the newer one is marked."""
+    order = sorted(range(len(rules)), key=lambda i: (rules[i].get("at", ""), i))
+    rank = {id(rules[i]): n for n, i in enumerate(order)}
+    for r in rules:
+        r.pop("supersededBy", None)
+        for o in rules:
+            if o is r or not covers(o, r):
+                continue
+            if covers(r, o) and rank[id(o)] > rank[id(r)]:
+                continue  # equivalent: keep the older one unmarked
+            r["supersededBy"] = o.get("match")
+            break
+
+
+def loadArchive(strict=False):
+    try:
+        with open(ARCHIVE_PATH) as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
+            raise ValueError('needs a "rules" list')
+        validateRuleList(data["rules"], os.path.basename(ARCHIVE_PATH))
+        return data["rules"]
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, RulesFileError) as e:
+        if strict:
+            raise RulesFileError(f"{os.path.basename(ARCHIVE_PATH)}: {e}")
+        return []
+
+
+def reviveRules(revived):
+    """Archived rules that decided a call move back into the live rules."""
+    if not revived:
+        return
+    ids = {ruleIdentity(r) for r in revived}
+    with Lock():
+        try:
+            archive = loadArchive(strict=True)
+            rules = loadRules()
+        except RulesFileError:
+            return
+        back = [r for r in archive if ruleIdentity(r) in ids]
+        if not back:
+            return
+        for r in back:
+            r.pop("archivedAt", None)
+        writeJson(ARCHIVE_PATH, {"rules": orderedRules([r for r in archive if ruleIdentity(r) not in ids])})
+        rules["rules"] += back
+        saveRules(rules)
 
 
 def prunePending(pending):
@@ -1672,6 +1903,7 @@ def decide(cmd, cwd, session="", data=None, gitAuth=()):
     """Returns (decision or None, reason, proposedRules). Rules that decided parts are
     left in USED_RULES."""
     USED_RULES.clear()
+    REVIVED.clear()
     data = data if data is not None else loadRules()
     grant = data.get("grants", {}).get(session, {})
     if not INTEREST_RE.search(cmd) and not grant.get("cmds"):
@@ -1700,6 +1932,10 @@ def decide(cmd, cwd, session="", data=None, gitAuth=()):
             continue
         seen.add((part.kind, part.match, part.sha, part.env))
         d = lookup(data["rules"], part, session, project)
+        if d is None and not data.get("noArchive"):
+            n = len(USED_RULES)
+            d = lookup(loadArchive(), part, session, project)
+            REVIVED.extend(USED_RULES[n:])
         if d == "deny":
             return "deny", f"sudo/rm guard: blocked by a deny rule: '{short(part.match, 120)}'" + \
                 (f" on {part.env}" if part.env else ""), []
@@ -1778,6 +2014,7 @@ def handlePre(data):
                 saveRecovery(rec)
     else:
         decision, reason, proposals = decide(cmd, data.get("cwd"), session, rules, gitAuth)
+        reviveRules(list(REVIVED))
         recordUsage(list(USED_RULES))
         if decision == "ask" and data.get("permission_mode") == "bypassPermissions":
             return  # skip-permissions session: a hook "ask" would still prompt; deny still applies
