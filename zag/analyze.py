@@ -5,7 +5,7 @@ import re
 from .defaults import ASSIGN_RE, COMPOSE_READONLY, CONTAINER_DESTRUCTIVE, CONTAINER_READONLY, CONTAINER_TOOLS, EXEC_WRAPPERS, GIT_KEYWORD, GIT_READONLY, GIT_RISKY, GIT_VALUE_OPTS, GLOB_CHARS, GUARDED, HOME, INTEREST_RE, INTERP_RE, RUN_BOOL_FLAGS, RUN_DROP_VALUE, RUN_KEEP_FLAGS, RUN_KEEP_NETWORK_HOST, RUN_KEEP_VALUE, SAFE_SUDO, SAFE_SUDO_BAD_ARGS, SCRATCH_ROOTS, SHELLS, SIMPLE_WRAPPERS, SSH_FORWARD_OPTS, SSH_LOCAL_EXEC_OPTIONS, SSH_VALUE_OPTS, SUDO_OK_FLAGS, TRIVIAL
 from .util import sha
 from .parse import Ask, commandSubstitutions, joinWords, splitCommands, stripHeredocs, stripRedirects, stripWrappers, tokenize
-from .rules import ruleMatches, textMatches
+from .rules import lookup, ruleMatches, textMatches
 
 
 # ---------------------------------------------------------------- parsing
@@ -42,7 +42,7 @@ class Ctx:
         self.sshHeredocs = []      # heredoc bodies whose command line mentions ssh
         self.nCommands = 0
         self.gitAuth = set()       # {"commit", "push"} authorized by the user's last message
-        self.gitAsks = []          # git add/commit/push not authorized
+        self.gitAsks = []          # (reason, git Part or None): git operations not authorized
         self.grantCmds = []        # session-granted command patterns
         self.rules = []
         self.session = ""
@@ -562,15 +562,29 @@ def checkGit(args, ctx):
     if ctx.remote or sub not in GIT_KEYWORD:
         ctx.allTrivial = False
         return
+    # a "git" rule overrides the keyword flow (e.g. a repo not used with a normal git flow)
+    part = Part("git", joinWords(["git"] + list(args)), f"git {sub}")
+    d = lookup(ctx.rules, part, ctx.session, ctx.project)
+    if d == "deny":
+        ctx.parts.append(part)  # decide() reports the deny
+        return
+    if d == "allow":
+        return
+    if d == "ask":
+        ctx.gitAsks.append((f"git {sub} [rule says ask]", None))
+        return
     need = GIT_KEYWORD[sub]
     risky = GIT_RISKY.get(sub)
     if need not in ctx.gitAuth:
-        ctx.gitAsks.append(f"git {sub} (not authorized: type '{need.capitalize()}' mid-sentence)")
+        why = f"git {sub} (not authorized: type '{need.capitalize()}' mid-sentence)"
     elif risky and any(risky.match(a) for a in rest):
-        ctx.gitAsks.append(f"git {sub} with risky args")
+        why = f"git {sub} with risky args"
     elif sub == "checkout" and (ctx.cwd is None or any(
             not a.startswith("-") and os.path.exists(os.path.join(ctx.cwd, a)) for a in rest)):
-        ctx.gitAsks.append("git checkout of a path (discards changes)")
+        why = "git checkout of a path (discards changes)"
+    else:
+        return
+    ctx.gitAsks.append((why, part))
 
 
 def analyzeScript(cmd, ctx, depth=0):

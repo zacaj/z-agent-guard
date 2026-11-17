@@ -23,7 +23,7 @@ def recordUsage(used):
         return
     ids = {}
     for r in used:
-        ids[ruleIdentity(r)] = ids.get(ruleIdentity(r), 0) + 1
+        ids[ruleIdentity(r)] = 1  # a rule counts once per call
     with Lock():
         try:
             rules = loadRules()
@@ -456,6 +456,8 @@ def recordPending(rules, entry):
         # repeat of an ask still pending: keep its rules (the user may have edited
         # them), just point it at this call
         entry["rules"] = same[-1]["rules"]
+        if "original" in same[-1]:
+            entry["original"] = same[-1]["original"]  # so "unedited" still compares equal
         rules["pending"] = [p for p in rules["pending"] if p not in same]
     rules["pending"].append(entry)
     rules["pending"] = prunePending(rules["pending"])
@@ -470,7 +472,10 @@ def learnApproval(rules, tid):
     ident = lambda r: (r.get("kind"), r.get("match"), r.get("sha"), r.get("sudo"),
                        r.get("session"), r.get("path"), r.get("env"))
     have = {ident(r) for r in rules["rules"]}
+    original = entry.get("original", [])
     for r in entry["rules"]:
+        if r.get("kind") == "git" and r in original:
+            continue  # unedited git proposal: "ask" is already the default
         # the approved command may have edited the script before running it; what you
         # approved is the post-edit file, so remember that content
         if r.get("kind") == "script" and r.get("sha", "*") != "*":

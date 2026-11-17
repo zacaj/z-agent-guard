@@ -97,7 +97,11 @@ def decide(cmd, cwd, session="", data=None, gitAuth=()):
             why = explainPart(part, data["rules"], session, project)
             asks.append(part.desc + (f" ({why})" if why else ""))
             proposals.append(proposeRule(part, session, project))
-    asks += ctx.gitAsks
+    for why, part in ctx.gitAsks:
+        asks.append(why)
+        if part is not None:
+            # shown in pending as "ask" (= the default); saved only if you edit it
+            proposals.append({**proposeRule(part, session, project), "decision": "ask"})
     if asks:
         return "ask", "agent guard: " + shapeNote(cmd, ctx) + "; ".join(asks), proposals
     if ctx.allTrivial:
@@ -137,7 +141,8 @@ def handlePre(data):
         if decision == "ask" and proposals and tid:
             with Lock():
                 rules, err = openRules()
-                entry = {"toolUseId": tid, "at": nowText(), "cmd": cmd[:500], "rules": proposals}
+                entry = {"toolUseId": tid, "at": nowText(), "cmd": cmd[:500], "rules": proposals,
+                         "original": json.loads(json.dumps(proposals))}
                 if err:  # broke between the two reads
                     rec = loadRecovery()
                     rec["pending"].append(entry)

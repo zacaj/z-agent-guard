@@ -168,6 +168,33 @@ class TestGit(GuardTest):
         self.assertEqual(d("git status && git stash", {"stash"}), "allow")
 
 
+class TestGitRules(GuardTest):
+    def post(self, tid):
+        self.run_(hook.handlePost, {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": tid,
+                                    "session_id": "S", "cwd": "/", "tool_input": {"command": "x"}})
+
+    def test_unedited_git_proposal_is_not_saved(self):
+        self.assertEqual(self.pre("git push origin main"), "ask")
+        pending = storage.loadRules()["pending"]
+        self.assertEqual([(r["kind"], r["decision"]) for r in pending[0]["rules"]], [("git", "ask")])
+        self.post("t1")
+        self.assertEqual(storage.loadRules()["rules"], [])
+
+    def test_edited_git_proposal_is_saved_and_applies(self):
+        self.assertEqual(self.pre("git push origin main"), "ask")
+        data = storage.loadRules()
+        data["pending"][0]["rules"][0].update(decision="allow", match="git push origin *")
+        storage.writeJson(storage.RULES_PATH, data)
+        self.post("t1")
+        self.assertEqual([r["match"] for r in storage.loadRules()["rules"]], ["git push origin *"])
+        self.assertEqual(self.pre("git push origin dev", tid="t2"), "allow")
+        self.assertEqual(self.pre("git push -f origin dev", tid="t3"), "ask")  # 2 words after push: no match
+
+    def test_git_deny_rule(self):
+        self.writeRules([{"decision": "deny", "kind": "git", "match": "git push **", "session": "*", "path": "/"}])
+        self.assertEqual(hook.decide("git push origin x", "/", "S", storage.loadRules(), {"push"})[0], "deny")
+
+
 class TestPromptGrants(GuardTest):
     def prompt(self, text):
         return self.run_(grants.handlePrompt, {"prompt": text, "session_id": "S"})

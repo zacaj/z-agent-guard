@@ -332,7 +332,16 @@ command. Other git subcommands are left to settings. One message can carry sever
 keywords ("okay, Stash it and Rebase, then Push"); they last until your next message.
 
 Only your own typed text counts: tool results, hook/system text and `<pasted_content>`
-are ignored. Nothing is learned from these prompts. Settings `deny` rules still win.
+are ignored. Settings `deny` rules still win.
+
+**git rules.** A git prompt puts a `kind: "git"` rule with `decision: "ask"` in `pending`
+(match = the git command, e.g. `git push origin main`). Approving it unedited saves nothing,
+since asking is already the default. Edit it first (e.g. `"decision": "allow"`,
+`"match": "git push origin *"`, `"path"` a repo that doesn't use a normal git flow) and it's
+saved on approval. Matching `git` rules are checked before keywords: `allow` skips the
+keyword requirement and the risky-argument checks, `ask` always asks, `deny` blocks. You
+can also write them by hand, e.g. `{"decision": "allow", "kind": "git", "match": "git **",
+"session": "*", "path": "/home/me/notes"}`.
 Requires the matching `git …` entries to be removed from settings `ask` (an `ask` there
 overrides the hook).
 
