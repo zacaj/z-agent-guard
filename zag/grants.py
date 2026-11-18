@@ -9,8 +9,7 @@ from .util import nowText
 from .storage import Lock, openRules, rulesFileWarning, saveRules
 
 
-def lastUserText(transcriptPath):
-    """Text of the user's most recent typed message (not tool results, hook or system text)."""
+def readTranscript(transcriptPath):
     try:
         with open(transcriptPath, "rb") as f:
             f.seek(0, 2)
@@ -18,26 +17,62 @@ def lastUserText(transcriptPath):
             f.seek(max(0, size - 4_000_000))
             lines = f.read().decode("utf-8", "replace").splitlines()
     except (OSError, TypeError):
-        return ""
-    for line in reversed(lines):
+        return []
+    out = []
+    for line in lines:
         try:
-            d = json.loads(line)
+            out.append(json.loads(line))
         except ValueError:
             continue
-        if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain") \
-                or d.get("isCompactSummary"):
+    return out
+
+
+def typedText(d):
+    """Text of a typed user message record, or None for anything else."""
+    if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain") \
+            or d.get("isCompactSummary"):
+        return None
+    c = (d.get("message") or {}).get("content")
+    if isinstance(c, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+            return None
+        c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return c if isinstance(c, str) else None
+
+
+def buttonLabels(recs):
+    """Labels of the desktop app's wrap_up buttons offered by the turn ending at recs[-1]
+    (scans back to the previous typed message). Clicking one sends its label as the prompt."""
+    labels = set()
+    for d in reversed(recs):
+        t = typedText(d)
+        if t is not None and stripInjected(t):
+            break
+        if d.get("type") != "assistant":
             continue
-        c = (d.get("message") or {}).get("content")
-        if isinstance(c, list):
-            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
-                continue
-            c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
-        if not isinstance(c, str):
-            continue
-        c = stripInjected(c)
+        for b in (d.get("message") or {}).get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "tool_use" \
+                    and str(b.get("name", "")).endswith("wrap_up"):
+                for a in (b.get("input") or {}).get("actions") or []:
+                    if isinstance(a, dict) and isinstance(a.get("label"), str):
+                        labels.add(a["label"].strip())
+    return labels
+
+
+def lastUserPrompt(transcriptPath):
+    """(text, isButton) of the user's most recent typed message (not tool results, hook or
+    system text); isButton = it is exactly a wrap_up button label from the turn before."""
+    recs = readTranscript(transcriptPath)
+    for i in range(len(recs) - 1, -1, -1):
+        t = typedText(recs[i])
+        c = stripInjected(t) if t is not None else ""
         if c:
-            return c
-    return ""
+            return c, c.strip() in buttonLabels(recs[:i])
+    return "", False
+
+
+def lastUserText(transcriptPath):
+    return lastUserPrompt(transcriptPath)[0]
 
 
 def stripInjected(text):
@@ -56,13 +91,14 @@ def gitMarkers(text):
     return out
 
 
-def gitAuthFrom(text):
+def gitAuthFrom(text, isButton=False):
     """This turn's authorizations: Keyword or Keyword* mid-sentence. A capital at a
-    sentence start is just grammar; quoted/emphasized words don't count either."""
+    sentence start is just grammar; quoted/emphasized words don't count either. A clicked
+    button label counts wherever the keyword is (choosing it is the authorization)."""
     auth = set()
     for m in GIT_AUTH_RE.finditer(text):
         before = text[:m.start()].rstrip(" \t")
-        if m.group(2) != "-*" and before and before[-1] not in ".!?\n\"'`*>":
+        if m.group(2) != "-*" and (isButton or before and before[-1] not in ".!?\n\"'`*>"):
             auth.add(m.group(1).lower())
     return auth
 
@@ -156,7 +192,8 @@ def handlePrompt(data):
         return
     marks = gitMarkers(text)
     markersOnly = isMarkersOnly(text)
-    if not markersOnly:
+    isButton = text.strip() in buttonLabels(readTranscript(data.get("transcript_path")))
+    if not markersOnly and not isButton:
         starts = sorted({k.capitalize() + suf for k, suf, st in marks if st})
         if starts:
             return promptBlock(

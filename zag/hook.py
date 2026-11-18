@@ -28,7 +28,7 @@ from .parse import Ask
 from .rules import REVIVED, USED_RULES, explainPart, lookup, proposeRule
 from .storage import Lock, RulesFileError, emptyRules, learnApproval, loadArchive, loadRecovery, loadRules, openRules, prunePending, recordPending, recordUsage, reviveRules, rulesFileWarning, saveRecovery, saveRules
 from .analyze import Ctx, Part, analyzeScript
-from .grants import gitAuthFrom, handlePrompt, lastUserText
+from .grants import gitAuthFrom, handlePrompt, lastUserPrompt
 
 
 # ---------------------------------------------------------------- decision
@@ -113,7 +113,7 @@ def handlePre(data):
     cmd = (data.get("tool_input") or {}).get("command", "")
     session = data.get("session_id", "")
     tid = data.get("tool_use_id")
-    gitAuth = gitAuthFrom(lastUserText(data.get("transcript_path"))) \
+    gitAuth = gitAuthFrom(*lastUserPrompt(data.get("transcript_path"))) \
         if re.search(r"\bgit\b", cmd) else set()
     with Lock():
         rules, err = openRules()

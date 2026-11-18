@@ -358,6 +358,7 @@ The same hook also runs on `UserPromptSubmit`:
 | a prompt that is **only** markers (`Commit* Rebase*`, `Push-*`, `[docker run*$]*`, `[npm publish]-*`) | recorded, then the prompt is **blocked** with a "✓ session grants now: …" message, so the agent never sees it |
 | `[pattern]*` / `[pattern]-*` | (markers-only prompts) allow/stop allowing any command matching `pattern` (same syntax as `match`: `*`, `**`, `*$`, `re:`) for this session. Matched per simple command; `deny` rules still win; local only (not over ssh) |
 | a keyword (any suffix) at the **start of a sentence** in a normal prompt | prompt is blocked with a reminder (could be ordinary capitalization); lowercase it or move it mid-sentence and resend |
+| a clicked desktop-app button (prompt exactly equals a `wrap_up` action label from the previous turn) | not treated as a sentence start; its keywords authorize the turn |
 
 Several markers can go in one prompt (`[cmd1]* [cmd2]-* Commit* Push-*`). Markers inside
 `code` spans or ``` blocks never count (so you can quote the syntax). Prompts starting with `/` or `!` are ignored. Grants are stored per session in the rules

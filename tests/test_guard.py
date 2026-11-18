@@ -219,6 +219,35 @@ class TestPromptGrants(GuardTest):
         self.assertEqual(self.prompt("Push that please")["decision"], "block")
         self.assertIsNone(self.prompt("hello there"))
 
+    def writeTranscript(self, *labels, after=None):
+        path = os.path.join(self.dir, "t.jsonl")
+        recs = [{"type": "user", "message": {"content": "do the thing"}},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "mcp__ccd_turn__wrap_up",
+                     "input": {"recap": "x", "actions": [{"label": l} for l in labels]}}]}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "content": "ok"}]}}]
+        if after:
+            recs.append({"type": "user", "message": {"content": after}})
+        with open(path, "w") as f:
+            f.write("\n".join(json.dumps(r) for r in recs))
+        return path
+
+    def test_button_click_is_not_sentence_start(self):
+        path = self.writeTranscript("Commit and push", "Not yet")
+        out = self.run_(grants.handlePrompt, {"prompt": "Commit and push", "session_id": "S",
+                                              "transcript_path": path})
+        self.assertIsNone(out)
+        out = self.run_(grants.handlePrompt, {"prompt": "Commit this now", "session_id": "S",
+                                              "transcript_path": path})
+        self.assertEqual(out["decision"], "block")
+
+    def test_button_click_authorizes(self):
+        path = self.writeTranscript("Commit it", after="Commit it")
+        self.assertEqual(grants.lastUserPrompt(path), ("Commit it", True))
+        self.assertEqual(grants.gitAuthFrom(*grants.lastUserPrompt(path)), {"commit"})
+        path = self.writeTranscript("Commit it", after="Commit something else")
+        self.assertEqual(grants.gitAuthFrom(*grants.lastUserPrompt(path)), set())
+
     def test_code_spans_ignored(self):
         self.assertIsNone(self.prompt("eg `[a]* Commit*`"))
 
