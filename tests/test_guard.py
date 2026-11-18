@@ -108,6 +108,13 @@ class TestSudo(GuardTest):
                           "session": "*", "path": "/", "env": "*"}])
         self.assertEqual(self.decide("sudo timeout 120 /usr/bin/chroot /var/tmp/r env A=1 x"), "allow")
 
+    def test_env_flags_judge_real_command(self):
+        self.writeRules([])
+        self.assertEqual(self.decide("sudo -n -E cat /etc/hosts"), "allow")
+        self.assertEqual(self.decide("sudo --preserve-env=PATH ls /root"), "allow")
+        self.assertEqual(self.decide("sudo -E rm /etc/x"), "ask")
+        self.assertEqual(self.decide("sudo -u bob ls"), "ask")
+
     def test_sudo_rule_needs_sudo_true(self):
         self.writeRules([{"decision": "allow", "kind": "pkill", "match": "foo", "session": "*", "path": "/"}])
         self.assertEqual(self.decide("sudo pkill foo"), "ask")

@@ -36,6 +36,8 @@ SAFE_SUDO_BAD_ARGS = {
     "journalctl": re.compile(r"^--(vacuum|rotate|flush|relinquish|sync|setup-keys|update-catalog)"),
 }
 SUDO_OK_FLAGS = {"-n", "--non-interactive"}
+# env-only flags: judged by the command they run (sudo still drops LD_*/env_delete vars)
+SUDO_ENV_FLAGS = {"-E", "--preserve-env", "-H", "--set-home"}
 
 # harmless enough to approve alongside guarded parts
 TRIVIAL = {"cd", "echo", "printf", "true", "false", ":", "sleep", "ls", "cat", "pwd", "test",

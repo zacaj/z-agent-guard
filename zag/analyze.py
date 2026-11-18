@@ -2,7 +2,7 @@
 import os
 import re
 
-from .defaults import ASSIGN_RE, COMPOSE_READONLY, CONTAINER_DESTRUCTIVE, CONTAINER_READONLY, CONTAINER_TOOLS, EXEC_WRAPPERS, GIT_KEYWORD, GIT_READONLY, GIT_RISKY, GIT_VALUE_OPTS, GLOB_CHARS, GUARDED, HOME, INTEREST_RE, INTERP_RE, RUN_BOOL_FLAGS, RUN_DROP_VALUE, RUN_KEEP_FLAGS, RUN_KEEP_NETWORK_HOST, RUN_KEEP_VALUE, SAFE_SUDO, SAFE_SUDO_BAD_ARGS, SCRATCH_ROOTS, SHELLS, SIMPLE_WRAPPERS, SSH_FORWARD_OPTS, SSH_LOCAL_EXEC_OPTIONS, SSH_VALUE_OPTS, SUDO_OK_FLAGS, TRIVIAL
+from .defaults import ASSIGN_RE, COMPOSE_READONLY, CONTAINER_DESTRUCTIVE, CONTAINER_READONLY, CONTAINER_TOOLS, EXEC_WRAPPERS, GIT_KEYWORD, GIT_READONLY, GIT_RISKY, GIT_VALUE_OPTS, GLOB_CHARS, GUARDED, HOME, INTEREST_RE, INTERP_RE, RUN_BOOL_FLAGS, RUN_DROP_VALUE, RUN_KEEP_FLAGS, RUN_KEEP_NETWORK_HOST, RUN_KEEP_VALUE, SAFE_SUDO, SAFE_SUDO_BAD_ARGS, SCRATCH_ROOTS, SHELLS, SIMPLE_WRAPPERS, SSH_FORWARD_OPTS, SSH_LOCAL_EXEC_OPTIONS, SSH_VALUE_OPTS, SUDO_ENV_FLAGS, SUDO_OK_FLAGS, TRIVIAL
 from .util import sha
 from .parse import Ask, commandSubstitutions, joinWords, splitCommands, stripHeredocs, stripRedirects, stripWrappers, tokenize
 from .rules import lookup, ruleMatches, textMatches
@@ -398,7 +398,8 @@ def checkSudo(words, ctx):
     args = words[1:]
     i = 0
     while i < len(args) and args[i].startswith("-"):
-        if args[i] not in SUDO_OK_FLAGS:
+        if args[i] not in SUDO_OK_FLAGS and args[i] not in SUDO_ENV_FLAGS \
+                and not args[i].startswith("--preserve-env="):
             addCmdPart(words, f"sudo {args[i]}", ctx)
             return
         i += 1
